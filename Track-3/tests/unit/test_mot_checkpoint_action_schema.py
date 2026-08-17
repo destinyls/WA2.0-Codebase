@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -86,6 +87,55 @@ def test_strict_mot_load_preserves_validated_action_schema(
     )
     assert saved_config["action_dim"] == 8
     assert saved_config["action_schema"] == "qpos8_next_step"
+
+
+def test_strict_qpos14_weights_only_load_binds_expected_checkpoint_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "is_mot": True,
+                "action_dim": 14,
+                "action_schema": "qpos14_joint_absolute_v1",
+                "mot_cross_attn_experts": ["video", "action"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    weights = transformer_dir / "diffusion_pytorch_model.safetensors"
+    weights.write_bytes(b"qpos14-parent")
+    monkeypatch.setattr(mot, "WanMoTTransformer3DModel", _FakeMoTModel)
+    monkeypatch.setattr(
+        safetensors.torch,
+        "load_file",
+        lambda path: {"weight": torch.zeros(1)},
+    )
+
+    with pytest.raises(ValueError, match="checkpoint SHA256"):
+        utils.load_mot_checkpoint(
+            tmp_path,
+            torch_dtype=torch.float32,
+            torch_device="cpu",
+            compatibility="strict",
+            target_action_dim=14,
+            target_action_schema="qpos14_joint_absolute_v1",
+            expected_checkpoint_sha256="0" * 64,
+        )
+
+    model = utils.load_mot_checkpoint(
+        tmp_path,
+        torch_dtype=torch.float32,
+        torch_device="cpu",
+        compatibility="strict",
+        target_action_dim=14,
+        target_action_schema="qpos14_joint_absolute_v1",
+        expected_checkpoint_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
+    )
+    assert model.config["action_schema"] == "qpos14_joint_absolute_v1"
 
 
 @pytest.mark.parametrize("recorded_schema", [None, "ee20_pi05"])

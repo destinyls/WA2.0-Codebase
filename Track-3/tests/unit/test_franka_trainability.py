@@ -31,6 +31,7 @@ class _ToyModel(nn.Module):
         self.sensor_id_embed = nn.Embedding(2, 2)
         self.local_tactile_proj = nn.Linear(2, 2)
         self.contact_gate = nn.Linear(2, 2)
+        self.agilex_wrench_conditioner = nn.Linear(2, 2)
         self.mot = _ToyMoT()
 
 
@@ -75,6 +76,7 @@ def test_disabled_tactile_parameters_are_excluded_from_adamw() -> None:
     assert contract.frozen_parameter_count == len(before)
     assert contract.trainable_parameter_count > 0
     assert len(contract.contract_sha256) == 64
+    assert any(name.startswith("agilex_wrench_conditioner") for name in before)
     for name, parameter in model.named_parameters():
         if name in before:
             assert not parameter.requires_grad

@@ -114,8 +114,7 @@ def resolve_track31_sampler_rank_alignment() -> str:
     )
     if value not in ("contiguous", "shape_balanced"):
         raise ValueError(
-            "N0_TRACK31_SAMPLER_RANK_ALIGNMENT must be contiguous or "
-            "shape_balanced"
+            "N0_TRACK31_SAMPLER_RANK_ALIGNMENT must be contiguous or " "shape_balanced"
         )
     return value
 

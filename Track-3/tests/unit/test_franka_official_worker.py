@@ -76,7 +76,7 @@ class _GoodBridge:
         )
 
     @staticmethod
-    def actions_array_to_action_packet(actions, **_kwargs):
+    def actions_array_to_action_packet(actions, **kwargs):
         row = np.asarray(actions)[0]
         quaternion = _Quaternion(
             x=float(row[4]),
@@ -84,9 +84,25 @@ class _GoodBridge:
             z=float(row[6]),
             w=float(row[3]),
         )
-        action = SimpleNamespace(target_pose_base=_Pose(orientation_xyzw=quaternion))
+        action = SimpleNamespace(
+            arm_id=kwargs.get("control_arm"),
+            target_pose_base=_Pose(orientation_xyzw=quaternion),
+        )
         step = SimpleNamespace(arm_actions=[action])
         return SimpleNamespace(action_chunk=[step])
+
+    @classmethod
+    def infer_output_to_action_packet(
+        cls, output, *, context, observation_timestamp_ns
+    ):
+        metadata = output["policy_metadata"]
+        return cls.actions_array_to_action_packet(
+            output["actions"],
+            context=context,
+            observation_timestamp_ns=observation_timestamp_ns,
+            action_format=metadata["action_format"],
+            control_arm=metadata["control_arm"],
+        )
 
 
 class _BrokenInputBridge(_GoodBridge):
@@ -110,11 +126,22 @@ class _BrokenInputBridge(_GoodBridge):
 
 class _BrokenOutputBridge(_GoodBridge):
     @staticmethod
-    def actions_array_to_action_packet(actions, **_kwargs):
+    def actions_array_to_action_packet(actions, **kwargs):
         row = np.asarray(actions)[0]
         quaternion = _Quaternion(*[float(value) for value in row[3:7]])
-        action = SimpleNamespace(target_pose_base=_Pose(orientation_xyzw=quaternion))
+        action = SimpleNamespace(
+            arm_id=kwargs.get("control_arm"),
+            target_pose_base=_Pose(orientation_xyzw=quaternion),
+        )
         return SimpleNamespace(action_chunk=[SimpleNamespace(arm_actions=[action])])
+
+
+class _WrongArmBridge(_GoodBridge):
+    @staticmethod
+    def actions_array_to_action_packet(actions, **kwargs):
+        packet = _GoodBridge.actions_array_to_action_packet(actions, **kwargs)
+        packet.action_chunk[0].arm_actions[0].arm_id = "left"
+        return packet
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -148,6 +175,7 @@ def test_wxyz_bridge_probe_checks_both_directions() -> None:
     report = _probe_loaded_bridge(_GoodBridge, _Schema)
 
     assert report["status"] == "pass"
+    assert report["control_arm"] == "right"
     assert report["identity_new_obs_pose7"][3:] == [1.0, 0.0, 0.0, 0.0]
     assert report["identity_action_packet_xyzw"] == [0.0, 0.0, 0.0, 1.0]
 
@@ -164,6 +192,11 @@ def test_wxyz_bridge_probe_rejects_positional_quaternions(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _probe_loaded_bridge(bridge, _Schema)
+
+
+def test_wxyz_bridge_probe_rejects_wrong_control_arm() -> None:
+    with pytest.raises(ValueError, match="control-arm routing"):
+        _probe_loaded_bridge(_WrongArmBridge, _Schema)
 
 
 def test_identity_ignores_unrelated_lfs_tree_but_binds_worker_code(

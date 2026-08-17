@@ -2,7 +2,6 @@
 import json
 import logging
 import os
-from collections.abc import Callable
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
@@ -11,10 +10,8 @@ import numpy as np
 import torch
 from einops import rearrange
 from lerobot.constants import HF_LEROBOT_HOME
-from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import get_episode_data_index
-from lerobot.datasets.video_utils import decode_video_frames
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -1236,8 +1233,6 @@ class LatentLeRobotDataset(LeRobotDataset):
 
 
 if __name__ == "__main__":
-    from tqdm import tqdm
-
     from n0_twam.configs import TWAM_CONFIGS
 
     dset = MultiLatentLeRobotDataset(TWAM_CONFIGS["base"])

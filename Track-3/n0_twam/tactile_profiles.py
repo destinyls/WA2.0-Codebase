@@ -533,6 +533,7 @@ def validate_serving_tactile_binding(
     live_use_contact_gate: object,
     live_tactile_global_zero: object,
     serve_task: str | None,
+    allow_dynamic_signed_routes: bool = False,
 ) -> tuple[dict[str, object], dict[str, int]]:
     """Validate one server's tactile route against a checkpoint contract."""
 
@@ -566,6 +567,8 @@ def validate_serving_tactile_binding(
     )
     repo_map = _repo_key_map(contract["per_repo_tactile_keys"])
     profile = str(contract["profile"])
+    if type(allow_dynamic_signed_routes) is not bool:
+        raise ValueError("allow_dynamic_signed_routes must be boolean")
     if serve_task is not None:
         if not isinstance(serve_task, str) or not serve_task:
             raise ValueError("serve_task must be a non-empty string")
@@ -575,7 +578,7 @@ def validate_serving_tactile_binding(
             )
         expected_keys = repo_map.get(serve_task, global_keys)
     else:
-        if profile == MIXED:
+        if profile == MIXED and not allow_dynamic_signed_routes:
             raise ValueError("mixed checkpoint serving requires an explicit serve_task")
         expected_keys = global_keys
     if live_keys != expected_keys:

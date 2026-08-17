@@ -31,6 +31,8 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from n0_twam.utils.utils import get_mesh_id
 
+from .wrench_conditioner import WrenchConditioner
+
 try:
     from flash_attn_interface import flash_attn_func
 except ImportError:
@@ -1573,10 +1575,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         tactile_encoder_dim=256,
         max_tactile_streams=4,
         use_local_tactile=True,
+        instantiate_local_tactile=None,
         use_contact_gate=False,
         contact_gate_layers=2,
         contact_gate_heads=8,
         contact_gate_stop_grad=True,
+        use_wrench_conditioner=False,
+        instantiate_wrench_conditioner=None,
+        wrench_arm_count=2,
+        wrench_max_frames=64,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -1588,7 +1595,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # action head. Default True (existing ckpts have it). Set False for pretrain
         # (GlobalTactile alone) — then post-train flips it on and the branch is
         # zero-init so warm-starting a no-local pretrain ckpt is identity at first.
-        self.use_local_tactile = use_local_tactile
+        self.use_local_tactile = bool(use_local_tactile)
+        self.instantiate_local_tactile = (
+            self.use_local_tactile
+            if instantiate_local_tactile is None
+            else bool(instantiate_local_tactile)
+        )
         inner_dim = num_attention_heads * attention_head_dim
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         self.patch_embedding_mlp = nn.Linear(
@@ -1642,7 +1654,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # sequence). Only built when use_local_tactile=True. Pretrain sets it False
         # (no local), post-train flips it True (warm-start: branch zero-init at the
         # output proj -> identity, so a no-local pretrain ckpt is unaffected at step 0).
-        if self.use_local_tactile:
+        if self.instantiate_local_tactile:
             self.local_tactile_patch_embed = nn.Linear(
                 tactile_latent_channels * math.prod(patch_size),
                 inner_dim,
@@ -1689,6 +1701,34 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 n_heads=int(contact_gate_heads),
                 stop_grad=bool(contact_gate_stop_grad),
             )
+
+        # AgileX-only wrist-wrench branch. Default OFF keeps every legacy
+        # Franka/UniVTAC/native checkpoint state-dict key unchanged.
+        self.use_wrench_conditioner = bool(use_wrench_conditioner)
+        self.instantiate_wrench_conditioner = (
+            self.use_wrench_conditioner
+            if instantiate_wrench_conditioner is None
+            else bool(instantiate_wrench_conditioner)
+        )
+        if self.instantiate_wrench_conditioner:
+            self.agilex_wrench_conditioner = WrenchConditioner(
+                hidden_dim=inner_dim,
+                max_frames=int(wrench_max_frames),
+                arm_count=int(wrench_arm_count),
+            )
+            self.agilex_wrench_pre_norm = FP32LayerNorm(
+                inner_dim, eps, elementwise_affine=False
+            )
+            self.agilex_wrench_cross_attn = WanAttention(
+                dim=inner_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                eps=eps,
+                cross_attention_dim_head=attention_head_dim,
+                attn_mode="torch",
+            )
+            nn.init.zeros_(self.agilex_wrench_cross_attn.to_out[0].weight)
+            nn.init.zeros_(self.agilex_wrench_cross_attn.to_out[0].bias)
 
         self.blocks = nn.ModuleList(
             [
@@ -1810,7 +1850,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         )
         # Linear patch embed → (B*S, num_patches, inner_dim)
         tokens = self.tactile_patch_embed(x)
-        num_patches_per_sensor = tokens.shape[1]
         tokens = rearrange(tokens, "(b s) n d -> b s n d", b=B, s=S)
 
         # Add sensor_id embedding (broadcast across all patches of that sensor)
@@ -1986,6 +2025,86 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             attn_out = rearrange(attn_out, "b l c -> 1 (b l) c")
         return action_hidden_states + attn_out
 
+    def _encode_agilex_wrench_condition(
+        self,
+        wrench,
+        *,
+        wrench_available_mask,
+        temporal_valid_mask,
+        contact_cond_drop,
+    ):
+        if not self.use_wrench_conditioner:
+            raise ValueError("AgileX wrench conditioning is disabled")
+        return self.agilex_wrench_conditioner(
+            wrench,
+            wrench_available_mask=wrench_available_mask,
+            temporal_valid_mask=temporal_valid_mask,
+            contact_cond_drop=contact_cond_drop,
+        )
+
+    def _apply_agilex_wrench_cross_attn(
+        self,
+        action_hidden_states,
+        wrench_tokens,
+        attn_mask=None,
+    ):
+        if not self.use_wrench_conditioner:
+            raise ValueError("AgileX wrench conditioning is disabled")
+        if wrench_tokens is None or wrench_tokens.dim() != 3:
+            raise ValueError("wrench_tokens must have shape (B, L, C)")
+        flattened_training_batch = (
+            action_hidden_states.shape[0] == 1 and wrench_tokens.shape[0] > 1
+        )
+        if flattened_training_batch:
+            batch_size = wrench_tokens.shape[0]
+            if action_hidden_states.shape[1] % batch_size != 0:
+                raise ValueError(
+                    "Flattened action token length must be divisible by wrench batch"
+                )
+            query = rearrange(action_hidden_states, "1 (b l) c -> b l c", b=batch_size)
+        else:
+            if action_hidden_states.shape[0] != wrench_tokens.shape[0]:
+                raise ValueError("action and wrench batch sizes must match")
+            query = action_hidden_states
+        query_norm = self.agilex_wrench_pre_norm(query.float()).type_as(query)
+        attention_output = self.agilex_wrench_cross_attn(
+            query_norm,
+            wrench_tokens,
+            wrench_tokens,
+            rotary_emb=None,
+            update_cache=0,
+            cache_name="agilex_wrench_cross",
+            attn_mask=attn_mask,
+        ).type_as(query)
+        if flattened_training_batch:
+            attention_output = rearrange(attention_output, "b l c -> 1 (b l) c")
+        return action_hidden_states + attention_output
+
+    @staticmethod
+    def _agilex_wrench_causal_mask(
+        action_latent_shape,
+        *,
+        wrench_frames,
+        wrench_arms,
+        chunk_size,
+        device,
+    ):
+        _, _, action_frames, action_height, action_width = action_latent_shape
+        action_tokens_per_frame = action_height * action_width
+        action_frame_ids = (
+            torch.arange(action_frames, device=device)
+            .repeat_interleave(action_tokens_per_frame)
+            .div(chunk_size, rounding_mode="floor")
+            .mul(2)
+            .add(1)
+        )
+        wrench_frame_ids = (
+            torch.arange(wrench_frames, device=device)
+            .mul(2)
+            .repeat_interleave(wrench_arms)
+        )
+        return (wrench_frame_ids[None, :] <= action_frame_ids[:, None])[None, None]
+
     def _time_embed(self, timesteps, H, W, dtype, action_mode=False):
         pach_scale_h, pach_scale_w = (
             (1, 1) if action_mode else (self.patch_size[1], self.patch_size[2])
@@ -2011,7 +2130,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
     @staticmethod
     def _should_drop_tactile_condition(action_dict):
-        value = action_dict.get("tactile_cond_drop", False)
+        value = action_dict.get(
+            "contact_cond_drop",
+            action_dict.get("tactile_cond_drop", False),
+        )
         if torch.is_tensor(value):
             value = value.detach().bool().flatten()
             return bool(value.numel() > 0 and value.any().item())
@@ -2056,6 +2178,20 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 anchor = term if anchor is None else anchor + term
         if anchor is None:
             return self.scale_shift_table.sum() * 0.0
+        return anchor
+
+    def _zero_agilex_wrench_parameter_anchor(self):
+        if not self.use_wrench_conditioner:
+            return self.scale_shift_table.sum() * 0.0
+        anchor = None
+        for module in (
+            self.agilex_wrench_conditioner,
+            self.agilex_wrench_pre_norm,
+            self.agilex_wrench_cross_attn,
+        ):
+            for parameter in module.parameters(recurse=True):
+                term = parameter.float().sum() * 0.0
+                anchor = term if anchor is None else anchor + term
         return anchor
 
     def _tactile_patch_grid_shape(self, tactile_latent):
@@ -2183,6 +2319,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 "tactile_global_clean_latent",
                 "tactile_local_latent",
                 "tactile_sensor_ids",
+                "wrench",
+                "wrench_available_mask",
             }
             present = sorted(forbidden.intersection(action_dict))
             if present:
@@ -2194,8 +2332,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                     "disabled tactile training requires local tactile and "
                     "contact gate off"
                 )
-        drop_tactile = tactile_disabled or self._should_drop_tactile_condition(
-            action_dict
+        contact_condition_dropped = self._should_drop_tactile_condition(action_dict)
+        has_tactile_target = any(
+            key in action_dict
+            for key in (
+                "tactile_global_noisy_latent",
+                "tactile_global_targets",
+            )
+        )
+        drop_tactile = tactile_disabled or (
+            contact_condition_dropped and not has_tactile_target
         )
         if drop_tactile:
             # CFG tactile drop: no tactile tokens enter the sequence. The
@@ -2281,7 +2427,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             # Encoded but kept separate from self-attn sequence. Skipped entirely when
             # use_local_tactile=False (pretrain): local_tactile_tokens stays None and
             # forward_train's `if local_tactile_tokens is not None` guard no-ops it.
-            if self.use_local_tactile:
+            if self.use_local_tactile and not contact_condition_dropped:
                 local_tactile_latent = self._require_tactile_entry(
                     action_dict,
                     "tactile_local_latent",
@@ -2293,6 +2439,38 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 )
         if drop_tactile:
             tactile_grid_shape = None
+
+        wrench_tokens = None
+        wrench_zero_anchor = None
+        wrench_frames = 0
+        wrench_arms = 0
+        if self.use_wrench_conditioner and not tactile_disabled:
+            wrench = action_dict.get("wrench")
+            if wrench is None:
+                wrench_zero_anchor = self._zero_agilex_wrench_parameter_anchor()
+            else:
+                required_wrench_fields = {
+                    "wrench_available_mask",
+                    "temporal_valid_mask",
+                    "contact_cond_drop",
+                }
+                missing_wrench_fields = sorted(
+                    required_wrench_fields - set(action_dict)
+                )
+                if missing_wrench_fields:
+                    raise ValueError(
+                        "wrench conditioning is missing fields: "
+                        + ", ".join(missing_wrench_fields)
+                    )
+                wrench = wrench.to(latent_hidden_states.dtype)
+                wrench_tokens = self._encode_agilex_wrench_condition(
+                    wrench,
+                    wrench_available_mask=action_dict["wrench_available_mask"],
+                    temporal_valid_mask=action_dict["temporal_valid_mask"],
+                    contact_cond_drop=action_dict["contact_cond_drop"],
+                )
+                wrench_frames = int(wrench.shape[1])
+                wrench_arms = int(wrench.shape[2])
 
         return dict(
             batch_size=batch_size,
@@ -2309,6 +2487,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             tactile_grid_shape=tactile_grid_shape,
             local_tactile_tokens=local_tactile_tokens,
             tactile_zero_anchor=tactile_zero_anchor,
+            wrench_tokens=wrench_tokens,
+            wrench_zero_anchor=wrench_zero_anchor,
+            wrench_frames=wrench_frames,
+            wrench_arms=wrench_arms,
+            contact_condition_dropped=contact_condition_dropped,
             text_hidden_states=text_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
         )
@@ -2663,9 +2846,27 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 attn_mask=local_attn_mask,
             )
 
+        if prepared["wrench_tokens"] is not None:
+            wrench_attn_mask = self._agilex_wrench_causal_mask(
+                action_dict["noisy_latents"].shape,
+                wrench_frames=prepared["wrench_frames"],
+                wrench_arms=prepared["wrench_arms"],
+                chunk_size=input_dict["chunk_size"],
+                device=action_hidden_states.device,
+            )
+            action_hidden_states = self._apply_agilex_wrench_cross_attn(
+                action_hidden_states,
+                prepared["wrench_tokens"],
+                attn_mask=wrench_attn_mask,
+            )
+
         if prepared["tactile_zero_anchor"] is not None:
             action_hidden_states = action_hidden_states + prepared[
                 "tactile_zero_anchor"
+            ].to(action_hidden_states.dtype)
+        if prepared["wrench_zero_anchor"] is not None:
+            action_hidden_states = action_hidden_states + prepared[
+                "wrench_zero_anchor"
             ].to(action_hidden_states.dtype)
 
         # Predictive-contact gate: gate the action stream by the GlobalTactile the
@@ -2679,7 +2880,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # optimisation), WITHOUT directly touching the gt_noisy prediction target,
         # so tactile prediction stays protected by construction. CFG-drop
         # (tactile_clean_out empty) -> no-op. inference uses the gt clean hidden.
-        if self.use_contact_gate:
+        if self.use_contact_gate and not prepared["contact_condition_dropped"]:
             action_hidden_states = self.contact_gate(
                 action_hidden_states, tactile_clean_out, batch_size
             )
@@ -2779,6 +2980,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             "tactile_sensor_ids",
             "tactile_noisy_latent",
             "tactile_timesteps",
+            "wrench",
+            "wrench_available_mask",
         }
         if tactile_disabled and any(key in input_dict for key in tactile_keys):
             raise ValueError("disabled tactile mode cannot carry tactile tensors")
@@ -2884,6 +3087,31 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 sensor_ids=tactile_sensor_ids,
             )
 
+        wrench_tokens = None
+        if (
+            action_mode
+            and self.use_wrench_conditioner
+            and not tactile_disabled
+            and input_dict.get("wrench") is not None
+        ):
+            required_wrench_fields = {
+                "wrench_available_mask",
+                "temporal_valid_mask",
+                "contact_cond_drop",
+            }
+            missing_wrench_fields = sorted(required_wrench_fields - set(input_dict))
+            if missing_wrench_fields:
+                raise ValueError(
+                    "wrench conditioning is missing fields: "
+                    + ", ".join(missing_wrench_fields)
+                )
+            wrench_tokens = self._encode_agilex_wrench_condition(
+                input_dict["wrench"].to(latent_hidden_states.dtype),
+                wrench_available_mask=input_dict["wrench_available_mask"],
+                temporal_valid_mask=input_dict["temporal_valid_mask"],
+                contact_cond_drop=input_dict["contact_cond_drop"],
+            )
+
         # Symdiff tactile: tactile tokens carry REAL spatial/temporal RoPE
         # positions (matching forward_train), so the model localises which sensor
         # / frame / spatial patch each tactile token belongs to.
@@ -2896,8 +3124,19 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             _, S_t, Fp_t, Hp_t, Wp_t = self._tactile_patch_grid_shape(
                 global_tactile_latent
             )
-            # Derive tactile time from the video grid so both streams advance.
-            _vid_frame_start = int(latent_grid_id[0, 0].min().item())
+            # Serving supplies this CPU scalar so the denoise hot path does not
+            # synchronize the accelerator merely to recover a known frame id.
+            _vid_frame_start_value = input_dict.get("frame_start_id")
+            if _vid_frame_start_value is None:
+                _vid_frame_start = int(latent_grid_id[0, 0].min().item())
+            elif (
+                isinstance(_vid_frame_start_value, bool)
+                or not isinstance(_vid_frame_start_value, int)
+                or _vid_frame_start_value < 0
+            ):
+                raise ValueError("frame_start_id must be a non-negative integer")
+            else:
+                _vid_frame_start = _vid_frame_start_value
             tactile_grid_id = self._build_tactile_grid_id(
                 B_g,
                 S_t,
@@ -3023,6 +3262,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 latent_hidden_states = self._apply_local_tactile_cross_attn(
                     latent_hidden_states,
                     local_tactile_tokens,
+                )
+            if wrench_tokens is not None:
+                latent_hidden_states = self._apply_agilex_wrench_cross_attn(
+                    latent_hidden_states,
+                    wrench_tokens,
                 )
             if self.use_contact_gate and not skip_tactile:
                 latent_hidden_states = self.contact_gate(

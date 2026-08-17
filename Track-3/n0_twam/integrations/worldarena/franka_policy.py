@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +27,7 @@ from .franka_actions import (
 from .franka_serve_bundle import verify_franka_serve_bundle
 
 POLICY_CONFIG_SCHEMA_VERSION = 2
+FRANKA_CONTROL_ARM: Final[str] = "right"
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DEVICE_PATTERN = re.compile(r"^[0-9]+$")
 
@@ -570,6 +571,7 @@ class Policy:
         self._pending_index = 0
         self._pending_commit_chunk: npt.NDArray[np.float32] | None = None
         self._pending_anchor: npt.NDArray[np.float32] | None = None
+        self._executed_actions: list[npt.NDArray[np.float32]] = []
         self._image_history: list[dict[str, npt.NDArray[np.uint8]]] = []
         self._awaiting_post_action_observation = False
 
@@ -586,6 +588,7 @@ class Policy:
             self._pending_index = 0
             self._pending_commit_chunk = None
             self._pending_anchor = None
+            self._executed_actions = []
             self._image_history = []
             self._awaiting_post_action_observation = False
             if self._prompt is not None:
@@ -606,11 +609,11 @@ class Policy:
         )
         self._awaiting_post_action_observation = False
 
-    def _commit_finished_chunk(self) -> None:
+    def _commit_finished_chunk(self) -> bool:
         if self._pending_actions is None or self._pending_index < len(
             self._pending_actions
         ):
-            return
+            return False
         if self._awaiting_post_action_observation:
             raise RuntimeError(
                 "final action observation is missing before cache grounding"
@@ -621,8 +624,18 @@ class Policy:
             raise RuntimeError(
                 "executed action and post-action observation counts differ"
             )
+        if len(self._executed_actions) != len(self._pending_actions):
+            raise RuntimeError("safe executed action and queued action counts differ")
+        frames, horizon = self._pending_commit_chunk.shape[1:]
+        start_index = frames * horizon - len(self._executed_actions)
+        committed_flat = np.moveaxis(self._pending_commit_chunk, 0, -1).reshape(-1, 20)
+        safe_executed = np.stack(self._executed_actions)
+        committed_flat[start_index:] = embed_ee10_in_ee20(
+            end_pose8_to_ee10(safe_executed)
+        )
+        committed_chunk = committed_flat.reshape(frames, horizon, 20).transpose(2, 0, 1)
         self._backend.commit_executed_chunk(
-            actions_ee20_cfh=self._pending_commit_chunk,
+            actions_ee20_cfh=np.ascontiguousarray(committed_chunk, dtype=np.float32),
             image_history=_subsample_grounding_history(self._image_history),
             action_anchor_ee20=self._pending_anchor,
         )
@@ -631,24 +644,55 @@ class Policy:
         self._pending_index = 0
         self._pending_commit_chunk = None
         self._pending_anchor = None
+        self._executed_actions = []
         self._image_history = []
+        return True
 
-    def _dequeue_action(self) -> tuple[npt.NDArray[np.float32], bool]:
+    def _dequeue_action(
+        self, *, current_pose: npt.NDArray[np.float32]
+    ) -> tuple[npt.NDArray[np.float32], bool]:
         if self._pending_actions is None or self._pending_interventions is None:
             raise RuntimeError("no Franka action is queued")
         if self._pending_index >= len(self._pending_actions):
             raise RuntimeError("Franka action queue is exhausted")
-        action = self._pending_actions[self._pending_index].copy()
-        intervened = bool(self._pending_interventions[self._pending_index])
+        planned = self._pending_actions[self._pending_index].copy()
+        action = _safe_chunk(
+            planned.reshape(1, 8),
+            current_pose=current_pose,
+            safety=self.config.safety,
+        )[0]
+        intervened = bool(
+            self._pending_interventions[self._pending_index]
+            or np.any(np.abs(action - planned) > 1e-6)
+        )
+        self._executed_actions.append(
+            np.ascontiguousarray(action.copy(), dtype=np.float32)
+        )
         self._pending_index += self.config.external_chunk_actions
         self._awaiting_post_action_observation = True
         return action.reshape(1, 8), intervened
 
     def infer(self, new_obs: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
+        input_ms = 0.0
+        grounding_ms = 0.0
+        generation_ms = 0.0
+        postprocess_ms = 0.0
+        timing_kind = "queue_hit"
+        grounded = False
+        generated = False
+        queue_depth_after = 0
         with self._lock:
             if "tactile" in new_obs:
                 raise ValueError("Franka vision-only Policy rejects tactile input")
+            images_raw = _mapping(new_obs.get("images"), label="images")
+            tactile_image_keys = tuple(
+                key for key in images_raw if "tactile" in str(key).lower()
+            )
+            if tactile_image_keys:
+                raise ValueError(
+                    "Franka vision-only Policy rejects tactile image input"
+                )
             prompt = new_obs.get("prompt")
             if not isinstance(prompt, str) or not prompt:
                 raise ValueError("Franka observation requires a non-empty prompt")
@@ -657,7 +701,6 @@ class Policy:
             self._prompt = prompt
             if not self._backend_reset:
                 self._reset_backend(prompt)
-            images_raw = _mapping(new_obs.get("images"), label="images")
             high = _image(images_raw.get("cam_high"), label="images.cam_high")
             wrist_value = images_raw.get("cam_left_wrist", images_raw.get("cam_wrist"))
             wrist = _image(wrist_value, label="images.cam_left_wrist")
@@ -678,9 +721,18 @@ class Policy:
                 "observation.images.top": high,
                 "observation.images.wrist_l": wrist,
             }
+            input_ms = (time.perf_counter() - started) * 1000.0
             self._record_post_action_observation(internal_images)
-            self._commit_finished_chunk()
+            grounding_started = time.perf_counter()
+            grounded = self._commit_finished_chunk()
+            grounding_ms = (time.perf_counter() - grounding_started) * 1000.0
+            postprocess_started = time.perf_counter()
             if self._pending_actions is None:
+                generated = True
+                timing_kind = (
+                    "cold_generation" if self._cold_chunk else "grounding_refill"
+                )
+                generation_started = time.perf_counter()
                 raw = np.asarray(
                     self._backend.infer(
                         images=internal_images,
@@ -688,6 +740,8 @@ class Policy:
                     ),
                     dtype=np.float32,
                 )
+                generation_ms = (time.perf_counter() - generation_started) * 1000.0
+                postprocess_started = time.perf_counter()
                 if raw.shape != (20, 2, 6) or not np.isfinite(raw).all():
                     raise ValueError("backend action must have shape [20,2,6]")
                 frames, horizon = raw.shape[1:]
@@ -735,9 +789,16 @@ class Policy:
                 self._pending_anchor = np.ascontiguousarray(
                     current_ee20.copy(), dtype=np.float32
                 )
+                self._executed_actions = []
                 self._image_history = []
-            actions, safety_intervened = self._dequeue_action()
+            actions, safety_intervened = self._dequeue_action(
+                current_pose=current_pose8
+            )
             safety_interventions = int(safety_intervened)
+            if self._pending_actions is None:
+                raise RuntimeError("Policy dequeued an action without a queue")
+            queue_depth_after = len(self._pending_actions) - self._pending_index
+            postprocess_ms = (time.perf_counter() - postprocess_started) * 1000.0
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         return {
             "actions": actions.astype(np.float32, copy=False),
@@ -745,6 +806,7 @@ class Policy:
                 "policy_id": self.config.policy_id,
                 "platform": "franka",
                 "action_format": "end_pose_base",
+                "control_arm": FRANKA_CONTROL_ARM,
                 "action_dim": 8,
                 "chunk_size": self.config.external_chunk_actions,
                 "quaternion_order": "wxyz",
@@ -754,12 +816,23 @@ class Policy:
                 "safety_intervened": safety_interventions > 0,
                 "safety_intervention_count": safety_interventions,
             },
-            "policy_timing": {"infer_ms": elapsed_ms},
+            "policy_timing": {
+                "kind": timing_kind,
+                "infer_ms": elapsed_ms,
+                "input_ms": input_ms,
+                "grounding_ms": grounding_ms,
+                "generation_ms": generation_ms,
+                "postprocess_ms": postprocess_ms,
+                "grounded": grounded,
+                "generated": generated,
+                "queue_depth_after": queue_depth_after,
+            },
         }
 
 
 __all__ = (
     "DirectN0FrankaBackend",
+    "FRANKA_CONTROL_ARM",
     "FrankaActionBackend",
     "FrankaPolicyConfig",
     "FrankaSafetyConfig",

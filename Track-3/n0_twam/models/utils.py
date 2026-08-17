@@ -1,5 +1,6 @@
 # Copyright 2025-2026 NeoteAI Team. All rights reserved.
 import hashlib
+import math
 import os
 import types
 
@@ -14,6 +15,7 @@ from transformers import (
 from .model import WanTransformer3DModel
 
 _WAN_CONV3D_FALLBACK_ENV = "N0_WAN_VAE_CONV3D_FALLBACK"
+_WAN_ATTENTION_FALLBACK_ENV = "N0_WAN_VAE_ATTENTION_FALLBACK"
 
 
 def _wan_causal_conv3d_as_2d(module, x, cache_x=None):
@@ -77,6 +79,56 @@ def _install_wan_conv3d_fallback(vae):
         raise RuntimeError("Wan VAE Conv3d fallback did not find causal convolutions")
 
 
+def _wan_attention_math_forward(module, x):
+    """Run exact single-head Wan VAE attention without fused SDPA kernels."""
+
+    identity = x
+    batch_size, channels, time, height, width = x.shape
+    hidden = x.permute(0, 2, 1, 3, 4).reshape(
+        batch_size * time, channels, height, width
+    )
+    hidden = module.norm(hidden)
+    qkv = module.to_qkv(hidden)
+    qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
+    qkv = qkv.permute(0, 1, 3, 2).contiguous()
+    query, key, value = qkv.chunk(3, dim=-1)
+    chunk_size = 256
+    scale = 1.0 / math.sqrt(channels)
+    key_transposed = key.float().transpose(-2, -1)
+    value_float = value.float()
+    attended_chunks = []
+    for start in range(0, query.shape[-2], chunk_size):
+        query_chunk = query[..., start : start + chunk_size, :].float()
+        scores = torch.matmul(query_chunk, key_transposed) * scale
+        probabilities = torch.softmax(scores, dim=-1)
+        attended_chunks.append(torch.matmul(probabilities, value_float))
+    attended = torch.cat(attended_chunks, dim=-2).to(dtype=query.dtype)
+    hidden = (
+        attended.squeeze(1)
+        .permute(0, 2, 1)
+        .reshape(batch_size * time, channels, height, width)
+    )
+    hidden = module.proj(hidden)
+    hidden = hidden.view(batch_size, time, channels, height, width)
+    return hidden.permute(0, 2, 1, 3, 4) + identity
+
+
+def _install_wan_attention_fallback(vae):
+    """Replace unsupported HCU SDPA in Wan VAE spatial attention."""
+
+    patched = 0
+    for module in vae.modules():
+        if module.__class__.__name__ != "WanAttentionBlock":
+            continue
+        if getattr(module, "_n0_twam_attention_fallback", False):
+            continue
+        module.forward = types.MethodType(_wan_attention_math_forward, module)
+        module._n0_twam_attention_fallback = True
+        patched += 1
+    if patched == 0:
+        raise RuntimeError("Wan VAE attention fallback did not find attention blocks")
+
+
 def _wan_conv3d_fallback_requested():
     value = os.environ.get(_WAN_CONV3D_FALLBACK_ENV, "").strip().lower()
     if value in {"", "0", "false", "no"}:
@@ -84,6 +136,17 @@ def _wan_conv3d_fallback_requested():
     if value in {"1", "true", "yes"}:
         return True
     raise ValueError(f"{_WAN_CONV3D_FALLBACK_ENV} must be one of 0/1/false/true/no/yes")
+
+
+def _wan_attention_fallback_requested():
+    value = os.environ.get(_WAN_ATTENTION_FALLBACK_ENV, "").strip().lower()
+    if value in {"", "0", "false", "no"}:
+        return False
+    if value in {"1", "true", "yes"}:
+        return True
+    raise ValueError(
+        f"{_WAN_ATTENTION_FALLBACK_ENV} must be one of 0/1/false/true/no/yes"
+    )
 
 
 def _sha256_path(path):
@@ -156,6 +219,8 @@ def load_vae(
     )
     if _wan_conv3d_fallback_requested():
         _install_wan_conv3d_fallback(vae)
+    if _wan_attention_fallback_requested():
+        _install_wan_attention_fallback(vae)
     return vae.to(torch_device)
 
 
@@ -374,7 +439,8 @@ def load_mot_checkpoint(
 
     compatibility="migrate_action" copies only exact-shape non-action tensors and
     deterministically resets the complete action projection allowlist. This keeps
-    20D EE and 8D qpos semantics from being silently mixed or sliced.
+    Action spaces such as 20D EE, 8D qpos, and 14D dual-arm qpos are therefore
+    never silently mixed or sliced.
     """
     import json
     import os
@@ -415,6 +481,25 @@ def load_mot_checkpoint(
             "config_overrides"
         )
     if compatibility == "strict":
+        if expected_checkpoint_sha256 is not None:
+            if not isinstance(expected_checkpoint_sha256, str) or (
+                len(expected_checkpoint_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_checkpoint_sha256
+                )
+            ):
+                raise ValueError(
+                    "strict checkpoint load requires a lowercase "
+                    "expected_checkpoint_sha256"
+                )
+            actual_checkpoint_sha256 = _sha256_path(
+                os.path.join(tdir, "diffusion_pytorch_model.safetensors")
+            )
+            if actual_checkpoint_sha256 != expected_checkpoint_sha256:
+                raise ValueError(
+                    "checkpoint SHA256 does not match the strict load contract"
+                )
         if (
             target_action_dim is not None
             and int(target_action_dim) != source_action_dim
@@ -430,23 +515,10 @@ def load_mot_checkpoint(
                         "missing action_schema adoption is restricted to the "
                         "released 20D ee20_absee checkpoint"
                     )
-                if not isinstance(expected_checkpoint_sha256, str) or (
-                    len(expected_checkpoint_sha256) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in expected_checkpoint_sha256
-                    )
-                ):
+                if expected_checkpoint_sha256 is None:
                     raise ValueError(
                         "missing action_schema adoption requires a lowercase "
                         "expected_checkpoint_sha256"
-                    )
-                actual_checkpoint_sha256 = _sha256_path(
-                    os.path.join(tdir, "diffusion_pytorch_model.safetensors")
-                )
-                if actual_checkpoint_sha256 != expected_checkpoint_sha256:
-                    raise ValueError(
-                        "checkpoint SHA256 does not match the schema adoption contract"
                     )
             elif recorded_action_schema != target_action_schema:
                 raise ValueError(
@@ -489,7 +561,12 @@ def load_mot_checkpoint(
     # can tell which modules a config_overrides "flip" newly enables (their weights
     # are legitimately absent from the ckpt -> keep zero-init, tolerate as missing).
     ckpt_use_local = bool(cfg.get("use_local_tactile", False))
+    ckpt_instantiate_local = bool(cfg.get("instantiate_local_tactile", ckpt_use_local))
     ckpt_use_gate = bool(cfg.get("use_contact_gate", False))
+    ckpt_use_wrench = bool(cfg.get("use_wrench_conditioner", False))
+    ckpt_instantiate_wrench = bool(
+        cfg.get("instantiate_wrench_conditioner", ckpt_use_wrench)
+    )
     if config_overrides:
         for k, v in config_overrides.items():
             cfg[k] = v
@@ -542,10 +619,21 @@ def load_mot_checkpoint(
     # (identity at step 0), so warm-starting a local-off ckpt is a no-op until
     # training moves it. Normal loads (no override) keep the strict check unchanged.
     tolerated = ["mot.shared_attn"]
-    if bool(cfg.get("use_local_tactile", False)) and not ckpt_use_local:
+    target_instantiate_local = bool(
+        cfg.get("instantiate_local_tactile", cfg.get("use_local_tactile", False))
+    )
+    if target_instantiate_local and not ckpt_instantiate_local:
         tolerated.append("local_tactile")
     if bool(cfg.get("use_contact_gate", False)) and not ckpt_use_gate:
         tolerated.append("contact_gate")
+    target_instantiate_wrench = bool(
+        cfg.get(
+            "instantiate_wrench_conditioner",
+            cfg.get("use_wrench_conditioner", False),
+        )
+    )
+    if target_instantiate_wrench and not ckpt_instantiate_wrench:
+        tolerated.append("agilex_wrench_")
     if compatibility == "migrate_action":
         copied_state, migration_plan = build_action_migration_plan(
             sd,

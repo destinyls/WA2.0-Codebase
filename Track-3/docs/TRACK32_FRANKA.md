@@ -17,7 +17,7 @@ The current WorldArena Franka command is `end_pose_base`:
 - quaternion order is scalar-first `wxyz`;
 - `joint_qpos=[joint_0..joint_6, gripper]` is an observation, not the action;
 - the Policy returns one `float32[1,8]` command per long-poll call and declares
-  `action_format=end_pose_base`;
+  `action_format=end_pose_base` plus `control_arm=right`;
 - the current Franka tasks expose two unique RGB views and no tactile stream.
 
 Always re-check the organizer documents before a submission:
@@ -282,7 +282,10 @@ n0-twam track32 policy-replay \
   --config /work/policy.json \
   --observation /work/offline-observation.npz \
   --prompt "clear the table" \
-  --steps 7 \
+  --steps 31 \
+  --control-hz 15 \
+  --minimum-refill-samples 2 \
+  --require-realtime \
   --output /work/offline-policy-replay.json
 ```
 
@@ -290,6 +293,12 @@ The NPZ must contain exactly `cam_high`, `cam_left_wrist`, `left_end_pose`, and
 `joint_qpos`. This replay proves Policy loading, pose8 protocol, safety gating,
 post-action observation accounting, and one cache commit. Its receipt always
 states that organizer and real-robot evaluation remain incomplete.
+
+The receipt records per-call phase timings and p50/p95/p99 separately for cold
+generation, queue hits, and grounding+refill. `--require-realtime` publishes no
+receipt unless queue/refill p99 is below the 66.7-ms 15-Hz control deadline. A
+short 7-step replay remains useful for protocol testing, but is deliberately
+insufficient for the realtime gate.
 
 The serve bundle links the large immutable model components and copies the
 small normalizer, then re-audits all identities whenever the Policy starts.
@@ -309,7 +318,12 @@ state. `infer()` maps `cam_high` and `cam_left_wrist`/`cam_wrist`, uses
 decodes the first EE10, applies signed safety limits, feeds the actually executed
 chunk plus time-aligned post-action RGB back to the N0 cache, and returns one
 official pose8 action. An incomplete chunk is discarded on reset and is never
-committed. Policy metadata reports whether safety intervened.
+committed. Policy metadata reports whether safety intervened. The public
+WorldArena bridge and Franka dummy policy resolve an omitted single-arm route to
+the canonical `right` arm. This Policy declares that route explicitly instead
+of depending on the bridge default. The `left_end_pose`, `joint_qpos_left`, and
+`cam_left_wrist` inputs are compatibility field names for the active Franka arm;
+they do not select the outgoing canonical arm ID.
 
 ### Organizer bridge quaternion audit and worker launch
 
@@ -343,7 +357,8 @@ n0-twam track32 bridge-audit \
 `real_world_benchmark/` tree. It applies one packaged patch and then runs the
 same two-direction semantic probe as `bridge-audit`. The audit also binds the
 bridge and official Hub worker file hashes. It rejects the unpatched revision,
-shadow imports, unrelated worker-code changes, or either wrong quaternion
+shadow imports, unrelated worker-code changes, failure to propagate Policy
+metadata to the canonical `right` control arm, or either wrong quaternion
 direction.
 
 For the official outbound HTTPS long-poll process, set the organizer-provided

@@ -1,5 +1,7 @@
 # Copyright 2025-2026 NeoteAI Team. All rights reserved.
 import argparse
+import hashlib
+import json
 import os
 import sys
 import time
@@ -11,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
-from einops import rearrange
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -44,9 +45,10 @@ from n0_twam.tactile_profiles import (
     validate_serving_tactile_binding,
     validate_tactile_profile_config,
 )
+from n0_twam.server_action_kv import ActionKVServerMixin
 
 
-class TWAM_Server:
+class TWAM_Server(ActionKVServerMixin):
 
     def __init__(self, job_config):
         self.cache_name = "pos"
@@ -145,6 +147,8 @@ class TWAM_Server:
             device=self.device,
             eval_mode=True,
         )
+        self._action_kv_request_sequence = 0
+        self._last_action_kv_reuse_receipt = None
 
     def _check_train_serve_consistency(self):
         """Refuse placeholder norm stats, and cross-check the checkpoint's
@@ -246,6 +250,13 @@ class TWAM_Server:
                         self.job_config, "tactile_global_zero", None
                     ),
                     serve_task=serve_task,
+                    allow_dynamic_signed_routes=bool(
+                        getattr(
+                            self.job_config,
+                            "allow_dynamic_signed_task_routes",
+                            False,
+                        )
+                    ),
                 )
             except ValueError as exc:
                 problems.append(f"tactile profile contract: {exc}")
@@ -660,10 +671,11 @@ class TWAM_Server:
 
     def _build_tactile_tensor(self, obs):
         tactile = obs.get("tactile")
+        tactile_keys = self._active_contact_keys("tactile")
         if tactile is None:
             if getattr(self.job_config, "synthetic_tactile_data", False):
                 tactile_height, tactile_width = self._tactile_image_size()
-                n_streams = len(self.job_config.tactile_keys)
+                n_streams = len(tactile_keys)
                 # match the number of frames the client sent for VIDEO (obs['obs']),
                 # so the synthetic black tactile is frame-aligned and the streaming VAE
                 # gets the same temporal length as video (a single frame on a >=3-frame
@@ -686,7 +698,7 @@ class TWAM_Server:
 
         tactile_history = tactile if isinstance(tactile, list) else [tactile]
         tactile_streams = []
-        for key in self.job_config.tactile_keys:
+        for key in tactile_keys:
             frames = []
             for tactile_frame_dict in tactile_history:
                 if key not in tactile_frame_dict:
@@ -714,9 +726,10 @@ class TWAM_Server:
         return mu_norm.unsqueeze(0).to(self.device, dtype=self.dtype)
 
     def _encode_tactile_obs(self, obs):
-        if not self.job_config.tactile_keys:
+        tactile_keys = self._active_contact_keys("tactile")
+        if not tactile_keys:
             raise ValueError(
-                "tactile cond server requires non-empty job_config.tactile_keys."
+                "tactile cond server requires a non-empty active tactile route."
             )
 
         # Tactile mirrors video: the persistent streaming VAE is advanced ONLY by
@@ -728,7 +741,7 @@ class TWAM_Server:
         if tactile_tensor is None:
             raise ValueError(
                 "tactile cond server requires obs['tactile'] with all configured "
-                f"tactile keys: {self.job_config.tactile_keys}"
+                f"tactile keys: {list(tactile_keys)}"
             )
 
         scale = 255.0 if float(tactile_tensor.max()) > 1.5 else 1.0
@@ -770,10 +783,7 @@ class TWAM_Server:
 
         sensor_id_map = getattr(self.job_config, "tactile_sensor_id_map", {}) or {}
         sensor_ids = torch.tensor(
-            [
-                int(sensor_id_map.get(key, idx))
-                for idx, key in enumerate(self.job_config.tactile_keys)
-            ],
+            [int(sensor_id_map.get(key, idx)) for idx, key in enumerate(tactile_keys)],
             dtype=torch.long,
             device=self.device,
         )[None]
@@ -790,6 +800,226 @@ class TWAM_Server:
             "tactile_global_latent": global_latent,
             "tactile_local_latent": local_latent,
             "tactile_sensor_ids": sensor_ids,
+        }
+
+    @staticmethod
+    def _route_keys(value, *, label):
+        if not isinstance(value, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            raise ValueError(f"{label} must be a list of non-empty strings")
+        keys = tuple(value)
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"{label} contains duplicates")
+        return keys
+
+    def _bind_active_contact_route(self, obs):
+        """Bind one already policy-verified task route for this reset session."""
+
+        tactile = obs.get("tactile_keys")
+        wrench = obs.get("wrench_keys")
+        signed_required = bool(
+            getattr(self.job_config, "require_signed_task_route", False)
+        )
+        if signed_required and (tactile is None or wrench is None):
+            raise ValueError(
+                "signed task route requires explicit tactile_keys and wrench_keys"
+            )
+        if tactile is None and wrench is None:
+            tactile_keys = tuple(getattr(self.job_config, "tactile_keys", ()))
+            wrench_keys = tuple(getattr(self.job_config, "wrench_keys", ()))
+        elif tactile is None or wrench is None:
+            raise ValueError("tactile_keys and wrench_keys must be provided together")
+        else:
+            tactile_keys = self._route_keys(tactile, label="tactile_keys")
+            wrench_keys = self._route_keys(wrench, label="wrench_keys")
+        if signed_required:
+            self._validate_signed_task_route(obs, tactile_keys, wrench_keys)
+        allowed_tactile = set(getattr(self.job_config, "tactile_keys", ()))
+        allowed_wrench = set(getattr(self.job_config, "wrench_keys", ()))
+        if not set(tactile_keys) <= allowed_tactile:
+            raise ValueError(
+                "active tactile route is outside the signed training route"
+            )
+        if not set(wrench_keys) <= allowed_wrench:
+            raise ValueError("active wrench route is outside the signed training route")
+        profile = getattr(self.job_config, "tactile_profile", None)
+        if profile == VISION_TACTILE and not tactile_keys:
+            raise ValueError("vision_tactile serving requires tactile inputs")
+        if profile == VISION_ONLY and (tactile_keys or wrench_keys):
+            raise ValueError("vision_only serving cannot activate contact inputs")
+        if not tactile_keys and wrench_keys:
+            raise ValueError("wrench input cannot be active without tactile input")
+        self.active_tactile_keys = tactile_keys
+        self.active_wrench_keys = wrench_keys
+
+    def _validate_signed_task_route(self, obs, tactile_keys, wrench_keys):
+        """Require reset fields to match the policy-config-bound task route."""
+
+        routes = getattr(self.job_config, "signed_task_routes", None)
+        if not isinstance(routes, dict) or not routes:
+            raise ValueError("signed task route contract is unavailable")
+        aggregate_sha256 = getattr(
+            self.job_config, "signed_task_route_contract_sha256", None
+        )
+        encoded_routes = json.dumps(
+            routes,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if (
+            not isinstance(aggregate_sha256, str)
+            or len(aggregate_sha256) != 64
+            or hashlib.sha256(encoded_routes).hexdigest() != aggregate_sha256
+        ):
+            raise ValueError("signed task route aggregate identity mismatch")
+        task_id = obs.get("task_id")
+        if not isinstance(task_id, str) or task_id not in routes:
+            raise ValueError("task_id is outside the signed task routes")
+        route = routes[task_id]
+        expected_fields = {
+            "task_id",
+            "prompt",
+            "tactile_required",
+            "wrench_required",
+            "tactile_keys",
+            "wrench_keys",
+            "contract_sha256",
+        }
+        if not isinstance(route, dict) or set(route) != expected_fields:
+            raise ValueError("signed task route contract is malformed")
+        route_core = {
+            key: value for key, value in route.items() if key != "contract_sha256"
+        }
+        encoded_route = json.dumps(
+            route_core,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if hashlib.sha256(encoded_route).hexdigest() != route["contract_sha256"]:
+            raise ValueError("signed task route self hash mismatch")
+        if route["task_id"] != task_id or route["prompt"] != obs.get("prompt"):
+            raise ValueError("task identity differs from the signed task route")
+        profile = getattr(self.job_config, "tactile_profile", None)
+        if obs.get("tactile_profile") != profile:
+            raise ValueError("tactile profile differs from the signed server profile")
+        route_tactile = self._route_keys(
+            route["tactile_keys"], label="signed tactile_keys"
+        )
+        route_wrench = self._route_keys(
+            route["wrench_keys"], label="signed wrench_keys"
+        )
+        if type(route["tactile_required"]) is not bool or route[
+            "tactile_required"
+        ] != bool(route_tactile):
+            raise ValueError("signed tactile requirement is inconsistent")
+        if type(route["wrench_required"]) is not bool or route[
+            "wrench_required"
+        ] != bool(route_wrench):
+            raise ValueError("signed wrench requirement is inconsistent")
+        if route_wrench and not route_tactile:
+            raise ValueError("signed wrench route requires tactile")
+        if tactile_keys != route_tactile or wrench_keys != route_wrench:
+            raise ValueError("active contact keys differ from the signed task route")
+
+    def _active_contact_keys(self, kind):
+        if kind not in {"tactile", "wrench"}:
+            raise ValueError(f"unknown contact route kind: {kind}")
+        active_name = f"active_{kind}_keys"
+        configured_name = f"{kind}_keys"
+        return tuple(
+            getattr(
+                self,
+                active_name,
+                tuple(getattr(self.job_config, configured_name, ())),
+            )
+        )
+
+    def _require_active_contact_route(self, obs):
+        """Reject a task-route change after reset without breaking legacy clients."""
+
+        tactile = obs.get("tactile_keys")
+        wrench = obs.get("wrench_keys")
+        if tactile is None and wrench is None:
+            return
+        if tactile is None or wrench is None:
+            raise ValueError("tactile_keys and wrench_keys must be provided together")
+        tactile_keys = self._route_keys(tactile, label="tactile_keys")
+        wrench_keys = self._route_keys(wrench, label="wrench_keys")
+        if tactile_keys != self._active_contact_keys("tactile"):
+            raise ValueError("tactile task route changed without reset")
+        if wrench_keys != self._active_contact_keys("wrench"):
+            raise ValueError("wrench task route changed without reset")
+
+    def _build_wrench_condition(self, obs):
+        """Build canonical [B,F,A,6] wrench tensors for the action model."""
+
+        active_keys = self._active_contact_keys("wrench")
+        if not active_keys:
+            if obs.get("wrench") is not None:
+                raise ValueError("inactive route cannot carry wrench observations")
+            return None
+        history = obs.get("wrench")
+        availability = obs.get("wrench_available_mask")
+        if history is None or availability is None:
+            raise ValueError("active wrench route requires wrench and availability")
+        frames = history if isinstance(history, list) else [history]
+        masks = availability if isinstance(availability, list) else [availability]
+        if not frames or len(frames) != len(masks):
+            raise ValueError("wrench history and availability must be frame-aligned")
+        arm_count = int(getattr(self.job_config, "wrench_arm_count", 0))
+        if arm_count <= 0:
+            raise ValueError("wrench_arm_count must be positive")
+        sensor_map = dict(getattr(self.job_config, "wrench_sensor_id_map", {}))
+        if any(key not in sensor_map for key in active_keys):
+            raise ValueError("active wrench route has no signed sensor id")
+        wrench = torch.zeros(
+            1,
+            len(frames),
+            arm_count,
+            6,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        available = torch.zeros(
+            1,
+            len(frames),
+            arm_count,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        for frame_index, (frame, frame_mask) in enumerate(zip(frames, masks)):
+            if not isinstance(frame, dict) or not isinstance(frame_mask, dict):
+                raise ValueError("each wrench frame and mask must be a mapping")
+            if set(frame) != set(active_keys) or set(frame_mask) != set(active_keys):
+                raise ValueError("wrench frame keys differ from the active task route")
+            for key in active_keys:
+                if type(frame_mask[key]) is not bool:
+                    raise ValueError("wrench availability values must be booleans")
+                value = np.asarray(frame[key])
+                if value.dtype != np.float32 or value.shape != (6,):
+                    raise ValueError("wrench values must be float32[6]")
+                if not np.isfinite(value).all():
+                    raise ValueError("wrench values must be finite")
+                sensor_id = int(sensor_map[key])
+                if not 0 <= sensor_id < arm_count:
+                    raise ValueError("wrench sensor id is outside wrench_arm_count")
+                if frame_mask[key]:
+                    wrench[0, frame_index, sensor_id] = torch.from_numpy(value).to(
+                        device=self.device, dtype=self.dtype
+                    )
+                    available[0, frame_index, sensor_id] = True
+        if not bool(available.any().item()):
+            raise ValueError("active wrench route has no available observation")
+        return {
+            "wrench": wrench,
+            "wrench_available_mask": available,
+            "temporal_valid_mask": torch.ones(
+                1, len(frames), dtype=torch.bool, device=self.device
+            ),
+            "contact_cond_drop": torch.zeros(1, dtype=torch.bool, device=self.device),
         }
 
     def _reset_tactile_state(self):
@@ -937,6 +1167,15 @@ class TWAM_Server:
                 input_dict["tactile_timesteps"] = input_dict[
                     "tactile_timesteps"
                 ].repeat(*reps)
+            for key in (
+                "wrench",
+                "wrench_available_mask",
+                "temporal_valid_mask",
+                "contact_cond_drop",
+            ):
+                if key in input_dict:
+                    reps = [2] + [1] * (input_dict[key].dim() - 1)
+                    input_dict[key] = input_dict[key].repeat(*reps)
         else:
             input_dict["grid_id"] = input_dict["grid_id"][None]
             input_dict["timesteps"] = input_dict["timesteps"][None]
@@ -953,12 +1192,14 @@ class TWAM_Server:
         frame_st_id=0,
         patch_size=(1, 2, 2),
         tactile_latents=None,
+        wrench_condition=None,
     ):
         logger.info(f"FRAME START ID: {frame_st_id}")
         input_dict = dict()
         if latent_model_input is not None:
             input_dict["latent_res_lst"] = {
                 "noisy_latents": latent_model_input,
+                "frame_start_id": int(frame_st_id),
                 "timesteps": torch.ones(
                     [latent_model_input.shape[2]],
                     dtype=torch.float32,
@@ -997,6 +1238,7 @@ class TWAM_Server:
         if action_model_input is not None:
             input_dict["action_res_lst"] = {
                 "noisy_latents": action_model_input,
+                "frame_start_id": int(frame_st_id),
                 "timesteps": torch.ones(
                     [action_model_input.shape[2]],
                     dtype=torch.float32,
@@ -1022,6 +1264,8 @@ class TWAM_Server:
                         getattr(self.job_config, "tactile_profile", None)
                     )
                 )
+            if wrench_condition is not None:
+                input_dict["action_res_lst"].update(wrench_condition)
 
             if action_cond is not None:
                 input_dict["action_res_lst"]["noisy_latents"][:, :, 0:1] = action_cond[
@@ -1133,6 +1377,13 @@ class TWAM_Server:
         ##### get prompt (bare reset falls back to the config prompt)
         if prompt is None:
             prompt = getattr(self.job_config, "prompt", None)
+        self._action_kv_episode_sequence = (
+            int(getattr(self, "_action_kv_episode_sequence", 0)) + 1
+        )
+        self._action_kv_request_sequence = 0
+        self._action_kv_prompt_sha256 = hashlib.sha256(
+            str(prompt or "").encode("utf-8")
+        ).hexdigest()
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
@@ -1181,6 +1432,7 @@ class TWAM_Server:
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
+        wrench_condition = self._build_wrench_condition(obs)
         if frame_st_id == 0:
             # Cold seed — mirror video's init_latent: encode the current tactile once
             # (advances the persistent tactile streaming VAE, just like _encode_obs does
@@ -1191,7 +1443,9 @@ class TWAM_Server:
             self.tactile_global_vae.clear_cache()
             self.tactile_local_vae.clear_cache()
             tactile_latents = (
-                self._encode_tactile_obs(obs) if self.job_config.tactile_keys else None
+                self._encode_tactile_obs(obs)
+                if self._active_contact_keys("tactile")
+                else None
             )
             self.last_tactile_latents = tactile_latents
             init_latent = self._encode_obs(obs)
@@ -1256,7 +1510,14 @@ class TWAM_Server:
 
         with (torch.no_grad(),):
             # 1. Video Generation Loop (co-generates GlobalTactile when enabled)
-            for i, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(
+                tqdm(
+                    timesteps,
+                    disable=not bool(
+                        getattr(self.job_config, "show_inference_progress", True)
+                    ),
+                )
+            ):
                 last_step = i == len(timesteps) - 1
                 latent_cond = (
                     init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
@@ -1358,96 +1619,27 @@ class TWAM_Server:
                 tactile_latents = dict(tactile_latents)
                 tactile_latents["tactile_global_latent"] = tactile_g
 
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                if frame_st_id != 0:
-                    action_cond = None
-                else:
-                    # cold-seed frame0 mode. delta: zeros == "stay" (correct, forced).
-                    # absolute (cfg.cold_seed_mode): free = do NOT clamp, let the model
-                    # denoise frame0 (its learned cold-start; base loader trained frame0
-                    # with loss ON, so this is the training-consistent mode — DEFAULT,
-                    # ablation-validated); current_state = clean-clamp normalized current
-                    # pose (semantically nice but never seen in training); zeros =
-                    # original (de-normalizes to q01/q99 midpoint = OOD).
-                    _cs_mode = (
-                        "zeros"
-                        if self._uses_pi05_delta_actions()
-                        else str(
-                            getattr(self.job_config, "cold_seed_mode", "free")
-                        ).lower()
-                    )
-                    _cs_val = obs.get("current_state")
-                    if _cs_mode == "free":
-                        action_cond = None
-                    elif _cs_mode == "current_state" and _cs_val is not None:
-                        _cs = np.asarray(_cs_val, dtype=np.float32).reshape(-1)
-                        _adim = int(self.job_config.action_dim)
-                        if _cs.shape[0] < _adim:
-                            _cs = np.pad(_cs, (0, _adim - _cs.shape[0]))
-                        _cs_chunk = np.repeat(
-                            _cs[:_adim].reshape(-1, 1, 1), self.action_per_frame, axis=2
-                        )
-                        action_cond = self.preprocess_action(_cs_chunk).to(
-                            device=self.device, dtype=self.dtype
-                        )
-                    else:
-                        action_cond = torch.zeros(
-                            [
-                                1,
-                                self.job_config.action_dim,
-                                1,
-                                self.action_per_frame,
-                                1,
-                            ],
-                            device=self.device,
-                            dtype=self.dtype,
-                        )
-
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id,
-                    tactile_latents=tactile_latents,
-                )
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict["action_res_lst"]),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True,
-                )
-
-                if not last_step:
-                    action_noise_pred = rearrange(
-                        action_noise_pred, "b (f n) c -> b c f n 1", f=frame_chunk_size
-                    )
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[
-                            1:
-                        ] + self.job_config.action_guidance_scale * (
-                            action_noise_pred[:1] - action_noise_pred[1:]
-                        )
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(
-                        action_noise_pred, t, actions, return_dict=False
-                    )
-
-                if action_cond is not None:
-                    actions[:, :, 0:1] = action_cond
+            actions = self._denoise_actions(
+                obs=obs,
+                frame_st_id=frame_st_id,
+                frame_chunk_size=frame_chunk_size,
+                action_timesteps=action_timesteps,
+                actions=actions,
+                tactile_latents=tactile_latents,
+                wrench_condition=wrench_condition,
+            )
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(
-            latents, os.path.join(self.exp_save_root, f"latents_{frame_st_id}.pt")
-        )
-        save_async(
-            actions, os.path.join(self.exp_save_root, f"actions_{frame_st_id}.pt")
-        )
+        if bool(getattr(self.job_config, "save_inference_artifacts", True)):
+            save_async(
+                latents,
+                os.path.join(self.exp_save_root, f"latents_{frame_st_id}.pt"),
+            )
+            save_async(
+                actions,
+                os.path.join(self.exp_save_root, f"actions_{frame_st_id}.pt"),
+            )
 
         current_state = obs.get("current_state")
         if current_state is None and "state" in obs:
@@ -1455,16 +1647,18 @@ class TWAM_Server:
         actions = self.postprocess_action(
             actions, current_state=current_state, cold_first_frame=(frame_st_id == 0)
         )
-        torch.cuda.empty_cache()
+        if bool(getattr(self.job_config, "empty_cache_each_request", True)):
+            torch.cuda.empty_cache()
         return actions, latents
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(
-            obs["obs"],
-            os.path.join(self.exp_save_root, f"obs_data_{self.frame_st_id}.pt"),
-        )
+        if bool(getattr(self.job_config, "save_inference_artifacts", True)):
+            save_async(
+                obs["obs"],
+                os.path.join(self.exp_save_root, f"obs_data_{self.frame_st_id}.pt"),
+            )
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = (
@@ -1483,8 +1677,11 @@ class TWAM_Server:
         )
         action_model_input = action_model_input.to(latent_model_input)
         tactile_latents = (
-            self._encode_tactile_obs(obs) if self.job_config.tactile_keys else None
+            self._encode_tactile_obs(obs)
+            if self._active_contact_keys("tactile")
+            else None
         )
+        wrench_condition = self._build_wrench_condition(obs)
         # [tactile-pred-eval] tactile_latents['tactile_global_latent'] here IS the REAL
         # tactile observed AFTER executing the previous chunk's actions (fed back by the client). Score
         # last chunk's GENERATED future tactile against it — the true "did the tactile
@@ -1522,6 +1719,7 @@ class TWAM_Server:
             action_model_input,
             frame_st_id=self.frame_st_id,
             tactile_latents=tactile_latents,
+            wrench_condition=wrench_condition,
         )
 
         with (torch.no_grad(),):
@@ -1538,8 +1736,26 @@ class TWAM_Server:
                 cache_name=self.cache_name,
                 action_mode=True,
             )
-        torch.cuda.empty_cache()
+        if bool(getattr(self.job_config, "empty_cache_each_request", True)):
+            torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+
+    def _prepare_plain_infer_cache(self, obs: dict[str, object]) -> None:
+        """Apply the request's prediction-cache policy before one generation.
+
+        ``update_cache=1`` marks imagined video/action KV as predicted, while
+        ``update_cache=2`` marks feedback from the robot as committed.  A full
+        replan must evict only the former: clearing the whole cache here would
+        silently discard the real RGB/tactile/action history established by
+        :meth:`_compute_kv_cache`.
+        """
+
+        full_replan = obs.get("full_replan", False)
+        if type(full_replan) is not bool:
+            raise ValueError("full_replan must be a boolean")
+        if full_replan:
+            self.transformer.clear_pred_cache(self.cache_name)
+            logger.info("[full-replan] cleared predicted KV and preserved committed KV")
 
     @torch.no_grad()
     def infer(self, obs):
@@ -1548,7 +1764,8 @@ class TWAM_Server:
         compute_kv_cache = obs.get("compute_kv_cache", False)
 
         if reset:
-            logger.info(f"******************* Reset server ******************")
+            logger.info("******************* Reset server ******************")
+            self._bind_active_contact_route(obs)
             # deterministic sampling for reproducible eval: seed torch/np RNG per episode
             # with the client-supplied eval seed, so the same seed reproduces the same
             # diffusion noise every run (fair A/B of cold-seed modes).
@@ -1565,11 +1782,14 @@ class TWAM_Server:
             self._reset(prompt=prompt)
             return dict()
         elif compute_kv_cache:
-            logger.info(f"################# Compute KV Cache #################")
+            self._require_active_contact_route(obs)
+            logger.info("################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
             return dict()
         else:
-            logger.info(f"################# Infer One Chunk #################")
+            self._require_active_contact_route(obs)
+            logger.info("################# Infer One Chunk #################")
+            self._prepare_plain_infer_cache(obs)
             # Keep the streaming VAE temporal cache after frame 0 so later
             # compute_kv_cache calls can encode raw sub-keyframes as a
             # continuation of the previous chunk.
@@ -1617,16 +1837,12 @@ class TWAM_Server:
         self._reset(self.job_config.prompt)
         init_obs = self.load_init_obs()
         pred_latent_lst = []
-        pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(
+            _, latents = self._infer(
                 init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size)
             )
-            actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
-            pred_action_lst.append(actions)
         pred_latent = torch.cat(pred_latent_lst, dim=2)
-        pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
         del self.transformer
@@ -1657,12 +1873,12 @@ def run(args):
     model = TWAM_Server(config)
     if config.infer_mode == "i2va":
         logger.info(
-            f"******************************USE i2va mode******************************"
+            "******************************USE i2va mode******************************"
         )
         model.generate()
     elif config.infer_mode == "server":
         logger.info(
-            f"******************************USE Server mode******************************"
+            "******************************USE Server mode******************************"
         )
         run_async_server_mode(model, local_rank, config.host, port)
     else:

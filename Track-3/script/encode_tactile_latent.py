@@ -589,13 +589,12 @@ def main() -> None:
             return
         raise ValueError("No episodes selected")
 
-    if verified_artifacts is not None:
-        if args.encoder_source_identity_path is None:
-            encoder_source_identity = build_encoder_source_identity(model_path)
-        else:
-            encoder_source_identity = load_encoder_source_identity(
-                args.encoder_source_identity_path
-            )
+    if args.encoder_source_identity_path is not None:
+        encoder_source_identity = load_encoder_source_identity(
+            args.encoder_source_identity_path
+        )
+    elif verified_artifacts is not None:
+        encoder_source_identity = build_encoder_source_identity(model_path)
     output_root.mkdir(parents=True, exist_ok=True)
 
     # Detect dataset format

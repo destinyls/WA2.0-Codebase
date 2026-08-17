@@ -28,6 +28,7 @@ from .identity import (
     validate_sha256,
     validate_transformer_identity_match,
 )
+from .compatibility import ACTION_PROJECTION_KEYS
 from .runtime_provenance import validate_checkpoint_runtime_provenance
 from .sidecar_snapshot import (
     capture_sidecar_snapshot,
@@ -63,6 +64,135 @@ def load_validated_action_migration_report(
         snapshot.json_object(label="action migration report"),
         target_action_schema=target_action_schema,
     )
+
+
+def load_validated_action_migration_report_for_contract(
+    checkpoint_dir: Path,
+    *,
+    source_action_dim: int,
+    source_action_schema: str,
+    target_action_dim: int,
+    target_action_schema: str,
+    initialized_target_only_prefixes: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Load and validate a dimension-agnostic migration sidecar."""
+
+    snapshot = capture_stable_json_file(
+        Path(checkpoint_dir) / "action_migration_report.json",
+        label="action migration report",
+    )
+    return validate_action_migration_report_for_contract(
+        snapshot.json_object(label="action migration report"),
+        source_action_dim=source_action_dim,
+        source_action_schema=source_action_schema,
+        target_action_dim=target_action_dim,
+        target_action_schema=target_action_schema,
+        initialized_target_only_prefixes=initialized_target_only_prefixes,
+    )
+
+
+def _strict_positive_integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _string_list(value: object, *, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise ValueError(f"{label} must be a JSON array of non-empty strings")
+    result = tuple(value)
+    if len(result) != len(set(result)):
+        raise ValueError(f"{label} must not contain duplicate keys")
+    return result
+
+
+def validate_action_migration_report_for_contract(
+    report: Mapping[str, object],
+    *,
+    source_action_dim: int,
+    source_action_schema: str,
+    target_action_dim: int,
+    target_action_schema: str,
+    initialized_target_only_prefixes: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Validate a dimension-agnostic action migration and exact key partition.
+
+    Unlike the legacy Track 3.1 helper below, this validator accepts an explicit
+    source/target contract and therefore supports new action spaces without
+    weakening the historical EE20-to-qpos8 lineage checks.
+    """
+
+    expected_source_dim = _strict_positive_integer(
+        source_action_dim, label="source action dimension"
+    )
+    expected_target_dim = _strict_positive_integer(
+        target_action_dim, label="target action dimension"
+    )
+    if not source_action_schema or not target_action_schema:
+        raise ValueError("action migration schemas must be non-empty")
+    if (
+        report.get("source_action_dim") != expected_source_dim
+        or report.get("source_action_schema") != source_action_schema
+        or report.get("target_action_dim") != expected_target_dim
+        or report.get("target_action_schema") != target_action_schema
+    ):
+        raise ValueError("action migration contract does not match source/target")
+    if report.get("compatibility") != "migrate_action":
+        raise ValueError("action migration compatibility must be migrate_action")
+
+    source_identity = validate_recorded_transformer_identity(
+        report.get("source_transformer_identity"),
+        expected_action_dim=expected_source_dim,
+    )
+    source_sha256 = validate_sha256(
+        report.get("source_checkpoint_sha256"),
+        label="migration source checkpoint SHA256",
+    )
+    if source_identity["sha256"] != source_sha256:
+        raise ValueError(
+            "action migration report source transformer identity and SHA256 "
+            "are inconsistent"
+        )
+
+    plan = report.get("plan")
+    required_plan_fields = {
+        "copied_keys",
+        "reset_keys",
+        "missing_target_keys",
+        "unexpected_source_keys",
+        "shape_mismatches",
+    }
+    if not isinstance(plan, Mapping) or set(plan) != required_plan_fields:
+        raise ValueError("action migration plan has an invalid field set")
+    copied = _string_list(plan.get("copied_keys"), label="copied key partition")
+    reset = _string_list(plan.get("reset_keys"), label="reset key partition")
+    target_only = _string_list(
+        plan.get("missing_target_keys"), label="target-only key partition"
+    )
+    unexpected = _string_list(
+        plan.get("unexpected_source_keys"), label="unexpected source key partition"
+    )
+    if unexpected:
+        raise ValueError("action migration contains unexpected source keys")
+    mismatches = plan.get("shape_mismatches")
+    if not isinstance(mismatches, list) or mismatches:
+        raise ValueError("action migration contains shape mismatches")
+    if set(reset) != set(ACTION_PROJECTION_KEYS):
+        raise ValueError("action migration reset key partition is incomplete")
+    if any(
+        not any(key.startswith(prefix) for prefix in initialized_target_only_prefixes)
+        for key in target_only
+    ):
+        raise ValueError("action migration contains an unapproved target-only key")
+    if (
+        set(copied) & set(reset)
+        or set(copied) & set(target_only)
+        or set(reset) & set(target_only)
+    ):
+        raise ValueError("action migration key partitions must be disjoint")
+    return dict(report)
 
 
 def validate_action_migration_report(
@@ -352,6 +482,7 @@ def validate_stage_a_parent_checkpoint(
 __all__ = (
     "STAGE_A_RUNTIME_LINEAGE_SCHEMA_VERSION",
     "load_validated_action_migration_report",
+    "load_validated_action_migration_report_for_contract",
     "validate_parent_training_checkpoint",
     "validate_action_migration_report",
     "validate_stage_a_parent_checkpoint",

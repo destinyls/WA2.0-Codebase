@@ -14,6 +14,7 @@ _TACTILE_PREFIXES = (
     "sensor_id_embed.",
     "local_tactile_",
     "contact_gate.",
+    "agilex_wrench_",
     "mot.experts.tactile.",
 )
 

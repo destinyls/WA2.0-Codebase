@@ -18,7 +18,11 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
-from .franka_policy import Policy, load_franka_policy_config
+from .franka_policy import (
+    FRANKA_CONTROL_ARM,
+    Policy,
+    load_franka_policy_config,
+)
 
 PINNED_WORLD_ARENA_REVISION = "6f5a981b34232fe77812b818a6ad7a4e6b8728ac"
 PINNED_ORIGINAL_BRIDGE_SHA256 = (
@@ -155,8 +159,14 @@ def _probe_loaded_bridge(bridge: ModuleType, schema: ModuleType) -> dict[str, ob
         )
 
     actions = np.asarray(((0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 0.5),), dtype=np.float32)
-    packet = bridge.actions_array_to_action_packet(
-        actions,
+    packet = bridge.infer_output_to_action_packet(
+        {
+            "actions": actions,
+            "policy_metadata": {
+                "action_format": "end_pose_base",
+                "control_arm": FRANKA_CONTROL_ARM,
+            },
+        },
         context=schema.SessionContext(
             session_id="n0-bridge-audit",
             episode_id="identity",
@@ -164,10 +174,14 @@ def _probe_loaded_bridge(bridge: ModuleType, schema: ModuleType) -> dict[str, ob
             task_instruction="hold",
         ),
         observation_timestamp_ns=1,
-        action_format="end_pose_base",
-        control_arm="left",
     )
     arm_action = packet.action_chunk[0].arm_actions[0]
+    observed_control_arm = getattr(arm_action, "arm_id", None)
+    if observed_control_arm != FRANKA_CONTROL_ARM:
+        raise ValueError(
+            "WorldArena Franka control-arm routing failed: "
+            f"observed={observed_control_arm!r}, expected={FRANKA_CONTROL_ARM!r}"
+        )
     quaternion = arm_action.target_pose_base.orientation_xyzw
     canonical_xyzw = np.asarray(
         (quaternion.x, quaternion.y, quaternion.z, quaternion.w), dtype=np.float64
@@ -180,6 +194,7 @@ def _probe_loaded_bridge(bridge: ModuleType, schema: ModuleType) -> dict[str, ob
         )
     return {
         "status": "pass",
+        "control_arm": FRANKA_CONTROL_ARM,
         "new_obs_quaternion_order": "wxyz",
         "action_quaternion_order": "wxyz",
         "canonical_quaternion_order": "xyzw",
