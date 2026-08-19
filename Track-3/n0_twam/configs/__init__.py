@@ -9,6 +9,14 @@ from .twam_multitask_server_cfg import twam_multitask_server_cfg
 from .twam_track31_univtac_cfg import twam_track31_univtac_cfg
 from .twam_track32_franka_cfg import twam_track32_franka_cfg
 from .twam_track32_franka_server_cfg import twam_track32_franka_server_cfg
+from .twam_track3_agilex_mixed_cfg import twam_track3_agilex_mixed_cfg
+from .twam_track3_agilex_server_cfg import twam_track3_agilex_server_cfg
+from .twam_track3_agilex_vision_only_cfg import (
+    twam_track3_agilex_vision_only_cfg,
+)
+from .twam_track3_agilex_vision_tactile_cfg import (
+    twam_track3_agilex_vision_tactile_cfg,
+)
 
 TWAM_CONFIGS = {
     "base": twam_base_cfg,
@@ -21,4 +29,8 @@ TWAM_CONFIGS = {
     "track31_univtac": twam_track31_univtac_cfg,
     "track32_franka": twam_track32_franka_cfg,
     "track32_franka_server": twam_track32_franka_server_cfg,
+    "track3_agilex_vision_tactile": twam_track3_agilex_vision_tactile_cfg,
+    "track3_agilex_mixed": twam_track3_agilex_mixed_cfg,
+    "track3_agilex_vision_only": twam_track3_agilex_vision_only_cfg,
+    "track3_agilex_server": twam_track3_agilex_server_cfg,
 }

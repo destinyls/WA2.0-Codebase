@@ -14,6 +14,12 @@ class MultiLatentLeRobotDataset:
             )
 
             return MultiLatentLeRobotFrankaDataset(*args, **kwargs)
+        if dataset_adapter == "worldarena_agilex_qpos14":
+            from .lerobot_latent_dataset_agilex import (
+                MultiLatentLeRobotAgileXDataset,
+            )
+
+            return MultiLatentLeRobotAgileXDataset(*args, **kwargs)
         if dataset_adapter:
             raise ValueError(f"unsupported dataset_adapter: {dataset_adapter!r}")
         action_schema = str(getattr(config, "action_schema", ""))
@@ -54,12 +60,20 @@ def __getattr__(name):
         )
 
         return MultiLatentLeRobotFrankaDataset
+    if name == "MultiLatentLeRobotAgileXDataset":
+        from .lerobot_latent_dataset_agilex import (
+            MultiLatentLeRobotAgileXDataset,
+        )
+
+        return MultiLatentLeRobotAgileXDataset
     raise AttributeError(name)
 
+
 __all__ = [
-    'MultiLatentLeRobotDataset',
-    'MultiLatentLeRobotPi05DeltaDataset',
-    'MultiLatentLeRobotQpos8Dataset',
-    'MultiLatentLeRobotFrankaDataset',
-    'BucketedDistributedBatchSampler',
+    "MultiLatentLeRobotDataset",
+    "MultiLatentLeRobotPi05DeltaDataset",
+    "MultiLatentLeRobotQpos8Dataset",
+    "MultiLatentLeRobotFrankaDataset",
+    "MultiLatentLeRobotAgileXDataset",
+    "BucketedDistributedBatchSampler",
 ]

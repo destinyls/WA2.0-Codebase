@@ -15,7 +15,13 @@ from n0_twam.evaluation.franka_offline_metrics import (
     PSNR_CAP_DB,
     evaluate_franka_offline_predictions,
 )
+from n0_twam.evaluation.franka_prediction_artifact import PREDICTION_SCHEMA_VERSION
 from n0_twam.evaluation.sealed_artifact_io import canonical_json
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
+)
 from n0_twam.integrations.worldarena.franka_views import build_standard_franka_views
 
 CHECKPOINT_SHA = "a" * 64
@@ -41,8 +47,8 @@ def _prediction_artifact(
     predicted_rgb = np.full_like(target_rgb, pixel_offset)
     target_pose = np.zeros((sample_count, 2, 8), dtype=np.float32)
     predicted_pose = target_pose.copy()
-    target_pose[..., 3] = 1.0
-    predicted_pose[..., 3] = 1.0
+    target_pose[..., 6] = 1.0
+    predicted_pose[..., 6] = 1.0
     predicted_pose[:, 0, 0] = position_offsets_m[0]
     predicted_pose[:, 1, 0] = position_offsets_m[1]
     if lerobot_episode_ids is None:
@@ -60,7 +66,7 @@ def _prediction_artifact(
     path = tmp_path / "predictions.npz"
     np.savez(
         path,
-        schema_version=np.asarray(1, dtype=np.int64),
+        schema_version=np.asarray(PREDICTION_SCHEMA_VERSION, dtype=np.int64),
         artifact_type=np.asarray(PREDICTION_ARTIFACT_TYPE),
         checkpoint_identity_sha256=np.asarray(CHECKPOINT_SHA),
         dataset_view_id=np.asarray(dataset_view_id),
@@ -69,6 +75,9 @@ def _prediction_artifact(
         seed=np.asarray(20260810, dtype=np.int64),
         run_role=np.asarray(run_role),
         prediction_mode=np.asarray("policy_action"),
+        wire_action_schema=np.asarray(FRANKA_ACTION_SCHEMA),
+        derived_action_schema=np.asarray(DERIVED_ACTION_SCHEMA),
+        quaternion_order=np.asarray(FRANKA_QUATERNION_ORDER),
         view_names=np.asarray(("cam_high", "cam_left_wrist")),
         frame_offsets=np.asarray(frame_offsets, dtype=np.int64),
         action_offsets=np.asarray((1, 2), dtype=np.int64),
@@ -133,6 +142,18 @@ def test_perfect_future_predictions_have_perfect_metrics_and_sealed_report(
         == hashlib.sha256(canonical_json(core)).hexdigest()
     )
     assert len(result["report_file_sha256"]) == 64
+
+
+def test_prediction_artifact_rejects_legacy_wxyz_contract(tmp_path: Path) -> None:
+    predictions = _prediction_artifact(tmp_path)
+    with np.load(predictions, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]).copy() for name in archive.files}
+    arrays["wire_action_schema"] = np.asarray("franka_end_pose_base_wxyz8_v1")
+    arrays["quaternion_order"] = np.asarray("wxyz")
+    np.savez(predictions, **arrays)
+
+    with pytest.raises(ValueError, match="representation contract mismatch"):
+        _evaluate(predictions, tmp_path / "legacy-metrics.json")
 
 
 def test_position_metrics_are_l2_mae_and_rmse_in_centimeters(tmp_path: Path) -> None:
@@ -259,6 +280,9 @@ def test_public_cli_materializes_prediction_artifact(tmp_path: Path) -> None:
                 "seed",
                 "run_role",
                 "prediction_mode",
+                "wire_action_schema",
+                "derived_action_schema",
+                "quaternion_order",
             )
         }
         arrays = {

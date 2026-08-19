@@ -33,7 +33,7 @@ class _Backend:
         }
         assert current_ee20.shape == (20,)
         poses = np.repeat(
-            np.asarray([[0, 0, 0, 1, 0, 0, 0, 0.5]], dtype=np.float32),
+            np.asarray([[0, 0, 0, 0, 0, 0, 1, 0.5]], dtype=np.float32),
             12,
             axis=0,
         )
@@ -45,7 +45,7 @@ class _Backend:
         self, *, actions_ee20_cfh, image_history, action_anchor_ee20
     ) -> None:
         assert actions_ee20_cfh.shape == (20, 2, 6)
-        assert len(image_history) == 4
+        assert len(image_history) in {4, 8}
         assert action_anchor_ee20.shape == (20,)
         self.commit_count += 1
 
@@ -100,7 +100,7 @@ def _observation(tmp_path: Path) -> Path:
         path,
         cam_high=np.zeros((8, 8, 3), dtype=np.uint8),
         cam_left_wrist=np.ones((8, 8, 3), dtype=np.uint8),
-        left_end_pose=np.asarray((0, 0, 0, 1, 0, 0, 0), dtype=np.float32),
+        left_end_pose=np.asarray((0, 0, 0, 0, 0, 0, 1), dtype=np.float32),
         joint_qpos=np.asarray((0, 0, 0, 0, 0, 0, 0, 0.5), dtype=np.float32),
     )
     return path
@@ -129,6 +129,19 @@ def test_offline_policy_replay_commits_cold_chunk_and_seals_receipt(
     assert result["steps"] == 7
     assert len(result["actions"]) == 7
     assert result["safety_intervention_count"] > 0
+    assert result["realtime_assessment"]["realtime_pass"] is False
+    assert result["realtime_assessment"]["failure_reasons"] == [
+        "insufficient_grounding_refill_samples"
+    ]
+    assert [row["kind"] for row in result["policy_timings"]] == [
+        "cold_generation",
+        "queue_hit",
+        "queue_hit",
+        "queue_hit",
+        "queue_hit",
+        "queue_hit",
+        "grounding_refill",
+    ]
     assert result["actions"][0][0] == pytest.approx(0.2)
     payload = json.loads(output.read_text(encoding="utf-8"))
     core = {

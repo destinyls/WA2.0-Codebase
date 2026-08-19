@@ -24,6 +24,7 @@ from .identity import (
 if TYPE_CHECKING:
     from .training_lineage import (
         load_validated_action_migration_report,
+        load_validated_action_migration_report_for_contract,
         validate_parent_training_checkpoint,
     )
 
@@ -35,6 +36,12 @@ def __getattr__(name: str) -> object:
         from .training_lineage import load_validated_action_migration_report
 
         return load_validated_action_migration_report
+    if name == "load_validated_action_migration_report_for_contract":
+        from .training_lineage import (
+            load_validated_action_migration_report_for_contract,
+        )
+
+        return load_validated_action_migration_report_for_contract
     if name == "validate_parent_training_checkpoint":
         from .training_lineage import validate_parent_training_checkpoint
 
@@ -54,6 +61,7 @@ __all__ = (
     "audit_transformer_checkpoint",
     "build_action_migration_plan",
     "load_validated_action_migration_report",
+    "load_validated_action_migration_report_for_contract",
     "validate_recorded_transformer_identity",
     "validate_parent_training_checkpoint",
     "validate_sha256",

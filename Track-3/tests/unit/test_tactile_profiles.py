@@ -318,6 +318,24 @@ def test_mixed_serving_rejects_missing_task_or_wrong_live_profile() -> None:
         )
 
 
+def test_mixed_dynamic_signed_serving_validates_global_union() -> None:
+    config = _config(MIXED)
+    payload = validate_tactile_profile_config(
+        config, repo_names=("touch", "rgb")
+    ).to_json_dict()
+
+    _, sensor_map = validate_serving_tactile_binding(
+        payload,
+        live_profile=MIXED,
+        live_tactile_keys=["tactile_a"],
+        serve_task=None,
+        allow_dynamic_signed_routes=True,
+        **_serve_semantics(config),
+    )
+
+    assert sensor_map == {"tactile_a": 0}
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

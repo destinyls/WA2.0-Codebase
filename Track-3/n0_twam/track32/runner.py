@@ -15,6 +15,11 @@ from n0_twam.checkpointing.strict_checkpoint_snapshot import (
     build_strict_checkpoint_identity,
     capture_strict_checkpoint_snapshot,
 )
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    TRACK32_PROFILE_ID,
+)
 from n0_twam.integrations.worldarena.franka_manifest import (
     OFFICIAL_RECORDS_SHA256,
 )
@@ -116,7 +121,7 @@ def _artifact_identity(request: Track32TrainRequest) -> dict[str, object]:
     )
     return {
         "schema_version": 1,
-        "profile": "franka_track32_vision_only_v1",
+        "profile": TRACK32_PROFILE_ID,
         "run_role": request.train.run_role,
         "source_records_sha256": OFFICIAL_RECORDS_SHA256,
         "train_view_id": (
@@ -184,8 +189,8 @@ def build_launch_plan(request: Track32TrainRequest) -> dict[str, object]:
             "seed": recipe.seed,
         },
         "model_contract": {
-            "wire_action_schema": "franka_end_pose_base_wxyz8_v1",
-            "derived_action_schema": "franka_ee10_rot6d_columns_v1",
+            "wire_action_schema": FRANKA_ACTION_SCHEMA,
+            "derived_action_schema": DERIVED_ACTION_SCHEMA,
             "model_action_schema": "ee20_absee",
             "active_action_channels": list(range(10)),
             "tactile_profile": "vision_only",
@@ -375,9 +380,9 @@ def _verify_completed_checkpoint(
     if meta.get("track32_artifact_identity") != _artifact_identity(request):
         raise ValueError("completed checkpoint artifact identity differs from request")
     expected_meta = {
-        "track32_profile_id": "franka_track32_vision_only_v1",
-        "source_action_schema": "franka_end_pose_base_wxyz8_v1",
-        "derived_action_schema": "franka_ee10_rot6d_columns_v1",
+        "track32_profile_id": TRACK32_PROFILE_ID,
+        "source_action_schema": FRANKA_ACTION_SCHEMA,
+        "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "tactile_profile": "vision_only",
         "tactile_mode": "disabled",
         "tactile_keys": [],

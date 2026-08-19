@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -22,6 +25,59 @@ def _write_template(path: Path, payload: Mapping[str, object]) -> Path:
     with destination.open("x", encoding="utf-8") as handle:
         handle.write(_json(payload) + "\n")
     return destination
+
+
+def _verified_file(path: Path, digest: str, *, label: str) -> Path:
+    from n0_twam.integrations.worldarena.agilex_manifest import sha256_file
+
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise ValueError(f"{label} must be a non-symlink regular file")
+    source = candidate.resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    if sha256_file(source) != digest:
+        raise ValueError(f"{label} SHA256 mismatch")
+    return source
+
+
+def _publish_artifact_pair(
+    artifacts: tuple[tuple[Path, bytes], tuple[Path, bytes]],
+) -> None:
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for destination, content in artifacts:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(
+                f".{destination.name}.{uuid.uuid4().hex}.tmp"
+            )
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+            staged.append((temporary, destination))
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        for temporary, destination in staged:
+            os.link(temporary, destination, follow_symlinks=False)
+    finally:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, object]:
+    source = Path(path).expanduser()
+    if source.is_symlink():
+        raise ValueError(f"{label} must be a non-symlink regular file")
+    source = source.resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {label}: {source}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain a JSON object")
+    return payload
 
 
 def _template_command(args: argparse.Namespace) -> dict[str, object]:
@@ -77,6 +133,186 @@ def _track32_train_command(args: argparse.Namespace) -> dict[str, object]:
     return run_track32_training(request, dry_run=args.dry_run)
 
 
+def _track32_agilex_template_command(args: argparse.Namespace) -> dict[str, object]:
+    from n0_twam.track32_agilex.request import agilex_train_request_template
+
+    payload = agilex_train_request_template()
+    result: dict[str, object] = {"kind": "agilex-train", "template": payload}
+    if args.output is not None:
+        result["output"] = str(_write_template(args.output, payload))
+    return result
+
+
+def _track32_agilex_train_command(args: argparse.Namespace) -> dict[str, object]:
+    from n0_twam.track32_agilex.request import load_agilex_train_request
+    from n0_twam.track32_agilex.runner import run_agilex_training
+
+    request = load_agilex_train_request(args.config)
+    return run_agilex_training(request, dry_run=args.dry_run)
+
+
+def _track32_agilex_build_artifacts_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    from n0_twam.configs import twam_track3_agilex_contracts as contracts
+    from n0_twam.integrations.worldarena import agilex_artifacts as artifacts
+    from n0_twam.integrations.worldarena import agilex_manifest as manifest_io
+
+    source = _verified_file(
+        args.source_manifest, args.source_manifest_sha256, label="source manifest"
+    )
+    route_file = _verified_file(
+        args.repo_route_manifest,
+        args.repo_route_manifest_file_sha256,
+        label="repo-route manifest",
+    )
+    temporal_file = _verified_file(
+        args.temporal_alignment,
+        args.temporal_alignment_file_sha256,
+        label="temporal alignment",
+    )
+    raw_dataset = Path(args.dataset_root).expanduser()
+    dataset_root = raw_dataset.resolve(strict=True)
+    binding = contracts.load_repo_route_binding(route_file)
+    repo_ids = tuple(sorted(binding.routes))
+    temporal = contracts.load_temporal_binding(
+        temporal_file,
+        repo_names=repo_ids,
+        repo_route_manifest_sha256=binding.manifest.contract_sha256,
+    )
+    manifest = manifest_io.load_agilex_manifest(
+        source,
+        expected_file_sha256=args.source_manifest_sha256,
+        selected_repo_ids=repo_ids,
+    )
+    route_ids = dict(temporal.route_identities)
+    temporal_ids = dict(temporal.temporal_identities)
+    for route in manifest.routes:
+        configured = binding.routes[route.repo_id]
+        expected = {
+            "embodiment": route.embodiment,
+            "action_schema": route.action_schema,
+            "rgb_keys": list(route.rgb_keys),
+            "tactile_keys": list(route.tactile_keys),
+            "wrench_keys": list(route.wrench_keys),
+        }
+        if configured != expected or route_ids[route.repo_id] != route.route_identity:
+            raise ValueError("AgileX source, route, and temporal identities differ")
+        if temporal_ids[route.repo_id] != route.temporal_alignment_identity:
+            raise ValueError("AgileX source temporal alignment identity mismatch")
+    outputs = tuple(
+        Path(value).expanduser().resolve(strict=False)
+        for value in (args.conversion_output, args.latent_output)
+    )
+    inputs = (dataset_root, source, route_file, temporal_file)
+    if any(
+        output == item or output in item.parents or item in output.parents
+        for index, output in enumerate(outputs)
+        for item in (*outputs[index + 1 :], *inputs)
+    ):
+        raise ValueError("AgileX artifact outputs must be disjoint from all inputs")
+    if any(
+        Path(value).expanduser().is_symlink() or output.exists()
+        for value, output in zip(
+            (args.conversion_output, args.latent_output), outputs, strict=True
+        )
+    ):
+        raise FileExistsError("AgileX artifact outputs must be new non-symlink files")
+    conversion = artifacts.build_agilex_conversion_receipt(
+        dataset_root=dataset_root,
+        routes=manifest.routes,
+        source_manifest_sha256=args.source_manifest_sha256,
+        repo_route_manifest_sha256=binding.manifest.contract_sha256,
+        temporal_alignment_contract_sha256=temporal.contract_sha256,
+    )
+    conversion_bytes = (_json(conversion) + "\n").encode("utf-8")
+    conversion_sha = hashlib.sha256(conversion_bytes).hexdigest()
+    latent = artifacts.build_agilex_latent_inventory(
+        dataset_root=dataset_root,
+        routes=manifest.routes,
+        conversion_receipt=conversion,
+        conversion_receipt_sha256=conversion_sha,
+    )
+    latent_bytes = (_json(latent) + "\n").encode("utf-8")
+    _publish_artifact_pair(((outputs[0], conversion_bytes), (outputs[1], latent_bytes)))
+    return {
+        "kind": "agilex-artifacts",
+        "status": "complete",
+        "conversion_output": str(outputs[0]),
+        "conversion_file_sha256": conversion_sha,
+        "conversion_identity_sha256": conversion["conversion_identity_sha256"],
+        "latent_output": str(outputs[1]),
+        "latent_file_sha256": hashlib.sha256(latent_bytes).hexdigest(),
+        "latent_inventory_sha256": latent["inventory_sha256"],
+        "record_count": latent["record_count"],
+    }
+
+
+def _track32_agilex_policy_template_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    from n0_twam.integrations.worldarena import agilex_policy_io
+
+    payload = agilex_policy_io.agilex_policy_config_template()
+    result: dict[str, object] = {"kind": "agilex-policy", "template": payload}
+    if args.output is not None:
+        result["output"] = str(_write_template(args.output, payload))
+    return result
+
+
+def _track32_agilex_policy_check_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    from n0_twam.integrations.worldarena import agilex_policy_io
+
+    config = agilex_policy_io.load_agilex_policy_config(args.config)
+    return {
+        "kind": "agilex-policy-check",
+        "status": "verified",
+        "config": str(config.source_path),
+        "policy_id": config.policy.policy_id,
+        "tactile_profile": config.policy.tactile_profile,
+        "task_ids": sorted(config.policy.task_routes),
+        "policy_config_file_sha256": config.policy_config_file_sha256,
+        "config_contract_sha256": config.config_contract_sha256,
+        "serve_bundle": str(config.serve_bundle),
+        "serve_bundle_identity_sha256": config.serve_bundle_identity_sha256,
+        "checkpoint_identity_sha256": config.checkpoint_identity_sha256,
+        "normalizer_contract_sha256": config.normalizer_contract_sha256,
+        "repo_route_manifest_sha256": config.repo_route_manifest_sha256,
+    }
+
+
+def _track32_agilex_serve_bundle_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    from n0_twam.integrations.worldarena.agilex_serve_bundle import (
+        build_agilex_serve_bundle,
+    )
+
+    return build_agilex_serve_bundle(
+        checkpoint=args.checkpoint,
+        checkpoint_identity_sha256=args.checkpoint_identity_sha256,
+        base_model=args.base_model,
+        normalizer=args.normalizer,
+        normalizer_file_sha256=args.normalizer_file_sha256,
+        normalizer_contract_sha256=args.normalizer_contract_sha256,
+        source_manifest_sha256=args.source_manifest_sha256,
+        repo_route_manifest=args.repo_route_manifest,
+        repo_route_manifest_file_sha256=args.repo_route_manifest_file_sha256,
+        repo_route_manifest_sha256=args.repo_route_manifest_sha256,
+        tactile_profile=args.tactile_profile,
+        contact_profile_contract_sha256=args.contact_profile_contract_sha256,
+        task_routes=_read_json_object(args.task_routes, label="AgileX task routes"),
+        task_routes_sha256=args.task_routes_sha256,
+        safety_contract=_read_json_object(
+            args.safety_contract, label="AgileX safety contract"
+        ),
+        safety_contract_sha256=args.safety_contract_sha256,
+        output=args.output,
+    )
+
+
 def _track32_policy_template_command(args: argparse.Namespace) -> dict[str, object]:
     from n0_twam.integrations.worldarena.franka_policy import (
         franka_policy_config_template,
@@ -115,6 +351,9 @@ def _track32_policy_replay_command(args: argparse.Namespace) -> dict[str, object
         prompt=args.prompt,
         steps=args.steps,
         output=args.output,
+        control_hz=args.control_hz,
+        require_realtime=args.require_realtime,
+        minimum_refill_samples=args.minimum_refill_samples,
     )
 
 
@@ -174,17 +413,9 @@ def _track32_pack_predictions_command(args: argparse.Namespace) -> dict[str, obj
     )
 
 
-def _track32_bridge_patch_command(args: argparse.Namespace) -> dict[str, object]:
-    from n0_twam.integrations.worldarena.franka_bridge_patch import (
-        apply_pinned_worldarena_bridge_patch,
-    )
-
-    return apply_pinned_worldarena_bridge_patch(args.worldarena_root)
-
-
 def _track32_bridge_audit_command(args: argparse.Namespace) -> dict[str, object]:
     from n0_twam.integrations.worldarena.franka_official_worker import (
-        PINNED_PATCHED_BRIDGE_SHA256,
+        PINNED_ORIGINAL_BRIDGE_SHA256,
         PINNED_WORLD_ARENA_REVISION,
         audit_worldarena_franka_bridge,
     )
@@ -193,14 +424,14 @@ def _track32_bridge_audit_command(args: argparse.Namespace) -> dict[str, object]
         args.worldarena_root,
         expected_revision=args.expected_revision or PINNED_WORLD_ARENA_REVISION,
         expected_bridge_sha256=(
-            args.expected_bridge_sha256 or PINNED_PATCHED_BRIDGE_SHA256
+            args.expected_bridge_sha256 or PINNED_ORIGINAL_BRIDGE_SHA256
         ),
     )
 
 
 def _track32_worker_command(args: argparse.Namespace) -> dict[str, object]:
     from n0_twam.integrations.worldarena.franka_official_worker import (
-        PINNED_PATCHED_BRIDGE_SHA256,
+        PINNED_ORIGINAL_BRIDGE_SHA256,
         PINNED_WORLD_ARENA_REVISION,
         run_official_franka_worker,
     )
@@ -209,7 +440,7 @@ def _track32_worker_command(args: argparse.Namespace) -> dict[str, object]:
         worldarena_root=args.worldarena_root,
         expected_revision=args.expected_revision or PINNED_WORLD_ARENA_REVISION,
         expected_bridge_sha256=(
-            args.expected_bridge_sha256 or PINNED_PATCHED_BRIDGE_SHA256
+            args.expected_bridge_sha256 or PINNED_ORIGINAL_BRIDGE_SHA256
         ),
         config_path=args.config,
         hub_url=args.hub_url,
@@ -340,6 +571,74 @@ def _build_parser() -> argparse.ArgumentParser:
         help="validate the request and print the resolved launch plan",
     )
     track32_train.set_defaults(handler=_track32_train_command)
+    agilex_template = track32_commands.add_parser(
+        "agilex-template",
+        help="write a strict hash-complete AgileX training request",
+    )
+    agilex_template.add_argument("--output", type=Path)
+    agilex_template.set_defaults(handler=_track32_agilex_template_command)
+    agilex_train = track32_commands.add_parser(
+        "agilex-train",
+        help="run AgileX preflight, qpos14 training, and checkpoint verification",
+    )
+    agilex_train.add_argument("--config", type=Path, required=True)
+    agilex_train.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate the request schema and print the resolved AgileX launch plan",
+    )
+    agilex_train.set_defaults(handler=_track32_agilex_train_command)
+    agilex_artifacts = track32_commands.add_parser(
+        "agilex-build-artifacts",
+        help="build immutable AgileX conversion and latent receipts",
+    )
+    agilex_artifacts.add_argument("--dataset-root", type=Path, required=True)
+    agilex_artifacts.add_argument("--source-manifest", type=Path, required=True)
+    agilex_artifacts.add_argument("--source-manifest-sha256", required=True)
+    for name in ("repo-route-manifest", "temporal-alignment"):
+        agilex_artifacts.add_argument(f"--{name}", type=Path, required=True)
+        agilex_artifacts.add_argument(f"--{name}-file-sha256", required=True)
+    agilex_artifacts.add_argument("--conversion-output", type=Path, required=True)
+    agilex_artifacts.add_argument("--latent-output", type=Path, required=True)
+    agilex_artifacts.set_defaults(handler=_track32_agilex_build_artifacts_command)
+    agilex_policy_template = track32_commands.add_parser(
+        "agilex-policy-template",
+        help="write a strict local AgileX Policy config template",
+    )
+    agilex_policy_template.add_argument("--output", type=Path)
+    agilex_policy_template.set_defaults(handler=_track32_agilex_policy_template_command)
+    agilex_policy_check = track32_commands.add_parser(
+        "agilex-policy-check",
+        help="verify an AgileX Policy config and sealed artifacts without loading",
+    )
+    agilex_policy_check.add_argument("--config", type=Path, required=True)
+    agilex_policy_check.set_defaults(handler=_track32_agilex_policy_check_command)
+    agilex_bundle = track32_commands.add_parser(
+        "agilex-serve-bundle",
+        help="seal a strict qpos14 checkpoint for the AgileX Policy",
+    )
+    agilex_bundle.add_argument("--checkpoint", type=Path, required=True)
+    agilex_bundle.add_argument("--checkpoint-identity-sha256", required=True)
+    agilex_bundle.add_argument("--base-model", type=Path, required=True)
+    agilex_bundle.add_argument("--normalizer", type=Path, required=True)
+    agilex_bundle.add_argument("--normalizer-file-sha256", required=True)
+    agilex_bundle.add_argument("--normalizer-contract-sha256", required=True)
+    agilex_bundle.add_argument("--source-manifest-sha256", required=True)
+    agilex_bundle.add_argument("--repo-route-manifest", type=Path, required=True)
+    agilex_bundle.add_argument("--repo-route-manifest-file-sha256", required=True)
+    agilex_bundle.add_argument("--repo-route-manifest-sha256", required=True)
+    agilex_bundle.add_argument(
+        "--tactile-profile",
+        choices=("vision_tactile", "mixed", "vision_only"),
+        required=True,
+    )
+    agilex_bundle.add_argument("--contact-profile-contract-sha256", required=True)
+    agilex_bundle.add_argument("--task-routes", type=Path, required=True)
+    agilex_bundle.add_argument("--task-routes-sha256", required=True)
+    agilex_bundle.add_argument("--safety-contract", type=Path, required=True)
+    agilex_bundle.add_argument("--safety-contract-sha256", required=True)
+    agilex_bundle.add_argument("--output", type=Path, required=True)
+    agilex_bundle.set_defaults(handler=_track32_agilex_serve_bundle_command)
     policy_template = track32_commands.add_parser(
         "policy-template", help="write the official Franka Policy config template"
     )
@@ -363,6 +662,23 @@ def _build_parser() -> argparse.ArgumentParser:
     policy_replay.add_argument("--observation", type=Path, required=True)
     policy_replay.add_argument("--prompt", required=True)
     policy_replay.add_argument("--steps", type=int, default=7)
+    policy_replay.add_argument(
+        "--control-hz",
+        type=float,
+        default=15.0,
+        help="control frequency used by the realtime latency gate",
+    )
+    policy_replay.add_argument(
+        "--minimum-refill-samples",
+        type=int,
+        default=2,
+        help="minimum synchronous refill samples required for a realtime pass",
+    )
+    policy_replay.add_argument(
+        "--require-realtime",
+        action="store_true",
+        help="fail without publishing a receipt unless queue/refill p99 meets deadline",
+    )
     policy_replay.add_argument("--output", type=Path, required=True)
     policy_replay.set_defaults(handler=_track32_policy_replay_command)
 
@@ -411,16 +727,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_predictions.add_argument("--output", type=Path, required=True)
     pack_predictions.set_defaults(handler=_track32_pack_predictions_command)
 
-    bridge_patch = track32_commands.add_parser(
-        "bridge-patch",
-        help="apply the pinned Franka WXYZ fix to a clean WorldArena checkout",
-    )
-    bridge_patch.add_argument("--worldarena-root", type=Path, required=True)
-    bridge_patch.set_defaults(handler=_track32_bridge_patch_command)
-
     bridge_audit = track32_commands.add_parser(
         "bridge-audit",
-        help="prove the WorldArena Franka WXYZ/XYZW bridge in both directions",
+        help="prove the unmodified WorldArena Franka XYZW bridge in both directions",
     )
     bridge_audit.add_argument("--worldarena-root", type=Path, required=True)
     bridge_audit.add_argument("--expected-revision")
@@ -441,10 +750,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow HTTP only for localhost dummy-Hub testing",
     )
-    worker.add_argument(
-        "--dry-run", action="store_true", help="audit without loading the model"
-    )
+    worker.add_argument("--dry-run", action="store_true", help="audit without loading")
     worker.set_defaults(handler=_track32_worker_command)
+
+    from n0_twam.track32_agilex.offline_cli import add_agilex_offline_commands
+
+    add_agilex_offline_commands(track32_commands)
     return parser
 
 

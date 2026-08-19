@@ -70,8 +70,8 @@ def test_track32_request_and_plan_pin_franka_contract(tmp_path: Path) -> None:
     assert request.runtime.accelerator_profile == "portable"
     assert plan["world_size"] == 8
     assert plan["model_contract"] == {
-        "wire_action_schema": "franka_end_pose_base_wxyz8_v1",
-        "derived_action_schema": "franka_ee10_rot6d_columns_v1",
+        "wire_action_schema": "franka_end_pose_base_xyzw8_v2",
+        "derived_action_schema": "franka_ee10_rot6d_columns_from_xyzw_v2",
         "model_action_schema": "ee20_absee",
         "active_action_channels": list(range(10)),
         "tactile_profile": "vision_only",

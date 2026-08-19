@@ -8,6 +8,7 @@ from .spec import ActionSpec
 
 # Explicit imports register built-ins only after the registry API is initialized.
 from . import ee20 as _ee20  # noqa: F401,E402  # isort: skip
+from . import qpos14 as _qpos14  # noqa: F401,E402  # isort: skip
 from . import qpos8 as _qpos8  # noqa: F401,E402  # isort: skip
 
 __all__ = (

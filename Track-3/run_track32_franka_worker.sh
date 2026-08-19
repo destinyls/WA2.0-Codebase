@@ -14,7 +14,7 @@ if [[ -n "${HUB_TOKEN:-}" ]]; then
   export WORLD_ARENA_HUB_TOKEN="${HUB_TOKEN}"
 fi
 
-"${PYTHON_BIN}" -m n0_twam.cli track32 bridge-patch \
+"${PYTHON_BIN}" -m n0_twam.cli track32 bridge-audit \
   --worldarena-root "${WORLD_ARENA_ROOT}"
 
 exec "${PYTHON_BIN}" -m n0_twam.cli track32 worker \

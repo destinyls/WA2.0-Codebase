@@ -19,7 +19,7 @@ from n0_twam.integrations.univtac.convert_lerobot import (
     build_lerobot_table_inventory,
 )
 
-from .franka_actions import DERIVED_ACTION_SCHEMA
+from .franka_actions import DERIVED_ACTION_SCHEMA, FRANKA_ACTION_SCHEMA
 from .franka_manifest import OFFICIAL_RECORDS_SHA256, canonical_sha256, sha256_file
 from .franka_views import (
     DEVELOPMENT_TRAIN_VIEW,
@@ -31,7 +31,7 @@ from .franka_views import (
 
 VIDEO_KEYS = ("observation.images.top", "observation.images.wrist_l")
 MODEL_ACTION_SCHEMA = "ee20_absee"
-SOURCE_ACTION_SCHEMA = "franka_end_pose_base_wxyz8_v1"
+SOURCE_ACTION_SCHEMA = FRANKA_ACTION_SCHEMA
 
 
 def _json_object(path: Path, *, label: str) -> dict[str, object]:

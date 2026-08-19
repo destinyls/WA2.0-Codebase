@@ -18,14 +18,15 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
-from .franka_policy import Policy, load_franka_policy_config
+from .franka_policy import (
+    FRANKA_CONTROL_ARM,
+    Policy,
+    load_franka_policy_config,
+)
 
 PINNED_WORLD_ARENA_REVISION = "6f5a981b34232fe77812b818a6ad7a4e6b8728ac"
 PINNED_ORIGINAL_BRIDGE_SHA256 = (
     "f5d264a1af4ff6b3eb22cd9cfedc9b4ebaff9a1f1d753ff08e60f2428340535e"
-)
-PINNED_PATCHED_BRIDGE_SHA256 = (
-    "4a65011aca4a08093a3024ed1377c76d49c296503aae24a867cc2ba193a4f9d4"
 )
 BRIDGE_RELATIVE_PATH = Path("real_world_benchmark/worldarena/bridges/legacy_policy.py")
 WORKER_RELATIVE_PATH = Path("real_world_benchmark/worldarena/hub_policy_worker.py")
@@ -113,10 +114,9 @@ def _capture_identity(
             f"WorldArena revision mismatch: {revision} != {expected_revision}"
         )
     changed = _changed_paths(root)
-    allowed = BRIDGE_RELATIVE_PATH.as_posix()
-    if any(path != allowed for path in changed):
+    if changed:
         raise ValueError(
-            "WorldArena checkout has changes outside the audited bridge: "
+            "WorldArena checkout must keep the verified XYZW bridge unmodified: "
             + ", ".join(changed)
         )
     bridge = _regular_file(root / BRIDGE_RELATIVE_PATH, label="WorldArena bridge")
@@ -138,25 +138,41 @@ def _capture_identity(
 
 
 def _probe_loaded_bridge(bridge: ModuleType, schema: ModuleType) -> dict[str, object]:
-    identity_pose = schema.Pose(
+    probe_xyzw = np.asarray((0.1, 0.2, 0.3, np.sqrt(0.86)), dtype=np.float64)
+    probe_pose = schema.Pose(
         position_m=schema.Vector3(0.1, 0.2, 0.3),
-        orientation_xyzw=schema.Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+        orientation_xyzw=schema.Quaternion(
+            x=float(probe_xyzw[0]),
+            y=float(probe_xyzw[1]),
+            z=float(probe_xyzw[2]),
+            w=float(probe_xyzw[3]),
+        ),
         frame="base",
     )
     legacy_pose = np.asarray(
-        bridge._arm_end_pose_7d(SimpleNamespace(ee_pose_base=identity_pose)),
+        bridge._arm_end_pose_7d(SimpleNamespace(ee_pose_base=probe_pose)),
         dtype=np.float64,
     )
-    expected_legacy = np.asarray((0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0), dtype=np.float64)
+    expected_legacy = np.concatenate(
+        (np.asarray((0.1, 0.2, 0.3), dtype=np.float64), probe_xyzw)
+    )
     if legacy_pose.shape != (7,) or not np.allclose(legacy_pose, expected_legacy):
         raise ValueError(
-            "WorldArena canonical-xyzw to Franka-new_obs-wxyz bridge failed: "
+            "WorldArena canonical-xyzw to Franka-new_obs-xyzw bridge failed: "
             f"observed={legacy_pose.tolist()}"
         )
 
-    actions = np.asarray(((0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 0.5),), dtype=np.float32)
-    packet = bridge.actions_array_to_action_packet(
-        actions,
+    actions = np.asarray(
+        ((0.1, 0.2, 0.3, *probe_xyzw.tolist(), 0.5),), dtype=np.float32
+    )
+    packet = bridge.infer_output_to_action_packet(
+        {
+            "actions": actions,
+            "policy_metadata": {
+                "action_format": "end_pose_base",
+                "control_arm": FRANKA_CONTROL_ARM,
+            },
+        },
         context=schema.SessionContext(
             session_id="n0-bridge-audit",
             episode_id="identity",
@@ -164,27 +180,32 @@ def _probe_loaded_bridge(bridge: ModuleType, schema: ModuleType) -> dict[str, ob
             task_instruction="hold",
         ),
         observation_timestamp_ns=1,
-        action_format="end_pose_base",
-        control_arm="left",
     )
     arm_action = packet.action_chunk[0].arm_actions[0]
+    observed_control_arm = getattr(arm_action, "arm_id", None)
+    if observed_control_arm != FRANKA_CONTROL_ARM:
+        raise ValueError(
+            "WorldArena Franka control-arm routing failed: "
+            f"observed={observed_control_arm!r}, expected={FRANKA_CONTROL_ARM!r}"
+        )
     quaternion = arm_action.target_pose_base.orientation_xyzw
     canonical_xyzw = np.asarray(
         (quaternion.x, quaternion.y, quaternion.z, quaternion.w), dtype=np.float64
     )
-    expected_canonical = np.asarray((0.0, 0.0, 0.0, 1.0), dtype=np.float64)
+    expected_canonical = probe_xyzw
     if not np.allclose(canonical_xyzw, expected_canonical):
         raise ValueError(
-            "WorldArena Franka-action-wxyz to canonical-xyzw bridge failed: "
+            "WorldArena Franka-action-xyzw to canonical-xyzw bridge failed: "
             f"observed={canonical_xyzw.tolist()}"
         )
     return {
         "status": "pass",
-        "new_obs_quaternion_order": "wxyz",
-        "action_quaternion_order": "wxyz",
+        "control_arm": FRANKA_CONTROL_ARM,
+        "new_obs_quaternion_order": "xyzw",
+        "action_quaternion_order": "xyzw",
         "canonical_quaternion_order": "xyzw",
-        "identity_new_obs_pose7": legacy_pose.tolist(),
-        "identity_action_packet_xyzw": canonical_xyzw.tolist(),
+        "probe_new_obs_pose7": legacy_pose.tolist(),
+        "probe_action_packet_xyzw": canonical_xyzw.tolist(),
     }
 
 
@@ -365,7 +386,6 @@ def run_official_franka_worker(
 
 __all__ = (
     "PINNED_ORIGINAL_BRIDGE_SHA256",
-    "PINNED_PATCHED_BRIDGE_SHA256",
     "PINNED_WORLD_ARENA_REVISION",
     "audit_worldarena_franka_bridge",
     "run_official_franka_worker",

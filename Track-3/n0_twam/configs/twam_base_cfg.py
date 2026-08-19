@@ -8,6 +8,7 @@ image-to-video-action demo (twam_i2va) all inherit from this and override only
 what they need. Every path below is a placeholder — point it at your own data,
 checkpoint, and base model.
 """
+
 import torch
 from easydict import EasyDict
 
@@ -22,9 +23,9 @@ cfg = twam_base_cfg
 cfg.wan22_pretrained_model_name_or_path = "/path/to/base-model"
 cfg.attn_window = 72
 cfg.frame_chunk_size = 2
-cfg.height = 256          # latent is already 256x256
+cfg.height = 256  # latent is already 256x256
 cfg.width = 256
-cfg.snr_shift = 5.0       # video / tactile resolution shift
+cfg.snr_shift = 5.0  # video / tactile resolution shift
 cfg.action_snr_shift = 1.0
 cfg.param_dtype = torch.bfloat16
 
@@ -36,19 +37,22 @@ cfg.action_num_inference_steps = 50
 cfg.video_exec_step = -1
 
 # ───────── observations ─────────
-cfg.obs_cam_keys = ["observation.images.third_view",
-                    "observation.images.left_wrist_view",
-                    "observation.images.right_wrist_view"]
-cfg.tactile_keys = ["observation.images.tactile_a",
-                    "observation.images.tactile_b"]
+cfg.obs_cam_keys = [
+    "observation.images.third_view",
+    "observation.images.left_wrist_view",
+    "observation.images.right_wrist_view",
+]
+cfg.tactile_keys = ["observation.images.tactile_a", "observation.images.tactile_b"]
 cfg.tactile_profile = VISION_TACTILE
 cfg.require_tactile_profile_receipt = False
 cfg.tactile_mode = "enabled"
 cfg.per_repo_tactile_keys = {}
 cfg.tactile_optional = False
 cfg.tactile_cfg_prob = 0.0
-cfg.tactile_sensor_id_map = {"observation.images.tactile_a": 0,
-                             "observation.images.tactile_b": 1}
+cfg.tactile_sensor_id_map = {
+    "observation.images.tactile_a": 0,
+    "observation.images.tactile_b": 1,
+}
 cfg.max_tactile_streams = 4
 cfg.active_tactile_sensor_count = len(cfg.tactile_sensor_id_map)
 # LocalTactile cross-attn branch into the action head. OFF in the released ckpt
@@ -71,14 +75,14 @@ cfg.action_dim = 20
 cfg.action_delta_mode = "pi05_delta"
 cfg.pi05_action_horizon = 16
 cfg.action_per_frame = 16
-cfg.pi05_source_action_is_delta = False   # absolute EE poses in the source
+cfg.pi05_source_action_is_delta = False  # absolute EE poses in the source
 cfg.pi05_state_column = "observation.state"
 cfg.pi05_delta_channel_ids = list(range(0, 9)) + list(range(10, 19))
 cfg.pi05_condition_first_frame_zero = True
 cfg.pi05_condition_first_frame_loss = False
 cfg.pi05_invalid_horizon_mask = True
 cfg.pi05_rot6d_relative_delta = False
-cfg.used_action_channel_ids = list(range(20))   # dual-arm default
+cfg.used_action_channel_ids = list(range(20))  # dual-arm default
 # Single-arm robots mask the right-arm half; the dataset loader applies this
 # automatically by matching the first token of the repo name against this set.
 cfg.single_arm_robot_prefixes = {"ur", "flexiv", "franka", "piper", "univtac", "neosim"}

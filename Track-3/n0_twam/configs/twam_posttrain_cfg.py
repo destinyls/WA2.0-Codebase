@@ -13,6 +13,7 @@ Pool layout (script/build_task_pool.py):
 
 Edit the EDIT-ME block, then `NGPU=8 bash run_posttrain.sh`.
 """
+
 import json
 from pathlib import Path
 
@@ -22,10 +23,10 @@ from n0_twam.tactile_profiles import VISION_TACTILE, validate_tactile_profile_co
 from .twam_base_cfg import twam_base_cfg
 
 # ───────── EDIT ME: paths / task ─────────
-_POOL = Path("/path/to/pools/my_task")               # task pool (layout above)
-_BASE_MODEL = "/path/to/base-model"                   # base model (vae/ tokenizer/ text_encoder/)
-_RELEASED_CKPT = "/path/to/n0-twam-checkpoint"        # released checkpoint (has transformer/)
-_EMPTY_EMB = "/path/to/base-model/empty_emb.pt"       # empty text embedding
+_POOL = Path("/path/to/pools/my_task")  # task pool (layout above)
+_BASE_MODEL = "/path/to/base-model"  # base model (vae/ tokenizer/ text_encoder/)
+_RELEASED_CKPT = "/path/to/n0-twam-checkpoint"  # released checkpoint (has transformer/)
+_EMPTY_EMB = "/path/to/base-model/empty_emb.pt"  # empty text embedding
 _SAVE_ROOT = str(_POOL / "runs" / "posttrain")
 _PROMPT = "your task instruction, verbatim from meta/tasks.jsonl"
 
@@ -36,7 +37,7 @@ _PROMPT = "your task instruction, verbatim from meta/tasks.jsonl"
 # and uses action channels list(range(20)).
 _CAM_KEYS = ["observation.images.top", "observation.images.wrist_l"]
 _TACTILE_KEYS = ["observation.images.tactile_a", "observation.images.tactile_b"]
-_USED_ACTION_CHANNELS = list(range(10))               # single-arm half of the 20-dim schema
+_USED_ACTION_CHANNELS = list(range(10))  # single-arm half of the 20-dim schema
 
 # Action representation: "absee" (absolute EE, the final validated recipe) or
 # "delta" (delta EE, horizon-delta). Selects action_delta_mode AND the norm file.
@@ -57,14 +58,14 @@ cfg.__name__ = f"Config: N0-TWAM post-train ({_ACTION_MODE}, MoT)"
 # data
 cfg.dataset_path = str(_POOL / "train")
 cfg.val_dataset_path = str(_POOL / "val")
-cfg.val_interval = 9999   # val pool == train pool here (not held-out) -> keep off
+cfg.val_interval = 9999  # val pool == train pool here (not held-out) -> keep off
 
 cfg.obs_cam_keys = list(_CAM_KEYS)
 cfg.tactile_profile = VISION_TACTILE
 cfg.require_tactile_profile_receipt = True
 cfg.tactile_mode = "enabled"
 cfg.tactile_keys = list(_TACTILE_KEYS)
-cfg.per_repo_obs_cam_keys = {}    # single-task pool: the global keys above apply
+cfg.per_repo_obs_cam_keys = {}  # single-task pool: the global keys above apply
 cfg.per_repo_tactile_keys = {}
 cfg.tactile_optional = False
 cfg.synthetic_tactile_data = False
@@ -107,7 +108,8 @@ else:  # keep import safe pre-data-prep; runtime guards refuse the placeholder
     cfg.norm_stat_path = str(_NORM) + " (MISSING)"
 _PER_ROBOT = _POOL / f"{_NORM_NAME}_per_robot.json"
 cfg.per_repo_norm_stat = (
-    json.loads(_PER_ROBOT.read_text()) if _PER_ROBOT.is_file() else {})
+    json.loads(_PER_ROBOT.read_text()) if _PER_ROBOT.is_file() else {}
+)
 
 # model / paths
 cfg.wan22_pretrained_model_name_or_path = _BASE_MODEL
@@ -161,8 +163,9 @@ assert cfg.action_norm_method == "q01q99"
 assert cfg.resume_from is None and cfg.init_from == _RELEASED_CKPT
 assert cfg.strict_training_resume is False
 # both streams knocked out at once is no tactile model at all — likely a mistake
-assert cfg.use_local_tactile or not cfg.tactile_global_zero, \
-    "local-off + global-zero removes the whole tactile pathway"
+assert (
+    cfg.use_local_tactile or not cfg.tactile_global_zero
+), "local-off + global-zero removes the whole tactile pathway"
 validate_tactile_profile_config(cfg)
 
 twam_posttrain_cfg = cfg

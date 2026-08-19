@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import socket
@@ -20,15 +21,16 @@ from n0_twam.checkpointing.strict_checkpoint_snapshot import (
     capture_strict_checkpoint_snapshot,
 )
 from n0_twam.configs.twam_track32_franka_cfg import twam_track32_franka_cfg
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    TRACK32_PROFILE_ID,
+)
 from n0_twam.integrations.worldarena.franka_artifacts import (
     MODEL_ACTION_SCHEMA,
     SOURCE_ACTION_SCHEMA,
     verify_franka_training_artifacts,
 )
 from n0_twam.integrations.worldarena.franka_manifest import sha256_file
-
-TRACK32_PROFILE_ID = "franka_track32_vision_only_v1"
-DERIVED_ACTION_SCHEMA = "franka_ee10_rot6d_columns_v1"
 
 
 def _required_env(name: str) -> str:
@@ -75,6 +77,18 @@ def _require_config_contract(config: object) -> None:
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "accelerator_profile": _required_env("N0_TRACK32_ACCELERATOR_PROFILE"),
+        "fsdp_topology": os.environ.get("N0_FSDP_TOPOLOGY", "global_shard"),
+        "fsdp_shard_size": int(
+            os.environ.get(
+                "N0_FSDP_SHARD_SIZE",
+                _required_env("N0_TRACK32_EXPECTED_WORLD_SIZE"),
+            )
+        ),
+        "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+        "nccl_net_gdr_level": os.environ.get("NCCL_NET_GDR_LEVEL"),
+        "nccl_dmabuf_enable": os.environ.get("NCCL_DMABUF_ENABLE"),
+        "nccl_net_plugin": os.environ.get("NCCL_NET_PLUGIN"),
+        "rccl_plugin_sha256": os.environ.get("N0_TRACK32_RCCL_PLUGIN_SHA256"),
         "action_dim": 20,
         "action_per_frame": 6,
         "tactile_profile": "vision_only",
@@ -125,11 +139,19 @@ def _require_recipe(config: object) -> None:
     if mismatches:
         raise ValueError(f"Franka recipe differs from request: {mismatches}")
     expected_world = int(_required_env("N0_TRACK32_EXPECTED_WORLD_SIZE"))
+    expected_nodes = int(os.environ.get("N0_TRACK32_EXPECTED_NNODES", "1"))
+    expected_local_world = int(
+        os.environ.get("N0_TRACK32_EXPECTED_LOCAL_WORLD_SIZE", str(expected_world))
+    )
     visible = tuple(
         value for value in _required_env("CUDA_VISIBLE_DEVICES").split(",") if value
     )
-    if expected_world <= 0 or len(visible) != expected_world:
-        raise ValueError("visible device count differs from expected world size")
+    if expected_world <= 0 or expected_nodes <= 0 or expected_local_world <= 0:
+        raise ValueError("distributed world dimensions must be positive")
+    if expected_nodes * expected_local_world != expected_world:
+        raise ValueError("node and local world sizes do not form the expected world")
+    if len(visible) != expected_local_world:
+        raise ValueError("visible device count differs from expected local world size")
 
 
 def _require_accelerator_profile() -> None:
@@ -190,6 +212,119 @@ def _require_accelerator_profile() -> None:
         raise ValueError(
             f"collective interface is unavailable in this container: {interface}"
         )
+    expected_nodes = int(os.environ.get("N0_TRACK32_EXPECTED_NNODES", "1"))
+    if expected_nodes > 1:
+        _require_multinode_hsdp_and_ib()
+
+
+def _require_character_device(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ValueError(f"required RDMA device is unavailable: {path}") from error
+    if not stat.S_ISCHR(metadata.st_mode):
+        raise ValueError(f"required RDMA path is not a character device: {path}")
+    if not os.access(path, os.R_OK | os.W_OK):
+        raise ValueError(f"required RDMA device is not readable/writable: {path}")
+
+
+def _require_hca_binding(entry: str, *, uverbs_index: int) -> None:
+    hca_name, _, port_text = entry.partition(":")
+    port = port_text or "1"
+    root = Path("/sys/class/infiniband") / hca_name
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"NCCL HCA sysfs entry is unavailable: {entry}") from error
+    uverbs = resolved_root / "device" / "infiniband_verbs" / f"uverbs{uverbs_index}"
+    if not uverbs.exists():
+        raise ValueError(f"NCCL HCA does not map to uverbs{uverbs_index}: {entry}")
+    port_root = resolved_root / "ports" / port
+    try:
+        state = (port_root / "state").read_text(encoding="utf-8").strip()
+        physical_state = (port_root / "phys_state").read_text(
+            encoding="utf-8"
+        ).strip()
+        rate = (port_root / "rate").read_text(encoding="utf-8").strip()
+        gid = (port_root / "gids" / "3").read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"unable to audit NCCL HCA port: {entry}") from error
+    if "ACTIVE" not in state or "LinkUp" not in physical_state:
+        raise ValueError(f"NCCL HCA port is not active/link-up: {entry}")
+    if not rate.startswith("400"):
+        raise ValueError(f"NCCL HCA port is not operating at 400 Gb/sec: {entry}")
+    if not gid or set(gid.replace(":", "")) == {"0"}:
+        raise ValueError(f"NCCL HCA GID index 3 is empty: {entry}")
+
+
+def _require_rccl_network_plugin() -> None:
+    plugin_root = Path(_required_env("N0_TRACK32_RCCL_PLUGIN_DIR"))
+    if plugin_root.is_symlink() or not plugin_root.is_dir():
+        raise ValueError("RCCL network plugin directory is unavailable")
+    plugin_name = _required_env("N0_TRACK32_RCCL_PLUGIN_FILENAME")
+    if Path(plugin_name).name != plugin_name:
+        raise ValueError("RCCL network plugin filename is invalid")
+    plugin_path = plugin_root / plugin_name
+    _require_hash(
+        plugin_path,
+        _required_sha("N0_TRACK32_RCCL_PLUGIN_SHA256"),
+        label="RCCL network plugin",
+    )
+    library_roster = _required_env("LD_LIBRARY_PATH").split(":")
+    if not library_roster or library_roster[0] != str(plugin_root):
+        raise ValueError("RCCL network plugin is not first in LD_LIBRARY_PATH")
+    try:
+        plugin = ctypes.CDLL(
+            str(plugin_path),
+            mode=ctypes.RTLD_LOCAL | os.RTLD_NOW,
+        )
+    except OSError as error:
+        raise ValueError(
+            "RCCL network plugin cannot be loaded with RTLD_NOW"
+        ) from error
+    if not hasattr(plugin, "ncclNetPlugin_v8"):
+        raise ValueError("RCCL network plugin does not export ncclNetPlugin_v8")
+
+
+def _require_multinode_hsdp_and_ib() -> None:
+    local_world_size = int(_required_env("N0_TRACK32_EXPECTED_LOCAL_WORLD_SIZE"))
+    expected = {
+        "N0_FSDP_TOPOLOGY": "hsdp",
+        "N0_FSDP_SHARD_SIZE": str(local_world_size),
+        "NCCL_DEBUG": "INFO",
+        "NCCL_DEBUG_SUBSYS": "INIT,NET,GRAPH",
+        "NCCL_IB_DISABLE": "0",
+        "NCCL_IB_GID_INDEX": "3",
+        "NCCL_IB_QPS_PER_CONNECTION": "4",
+        "NCCL_IB_TC": "160",
+        "NCCL_IB_TIMEOUT": "22",
+        "NCCL_NET_PLUGIN": "shca",
+        "N0_TRACK32_RCCL_PLUGIN_HOST_DIR": (
+            "/opt/hpc/software/app/rccl/shca_rdma_plugins/v8/lib"
+        ),
+        "NCCL_NET_GDR_LEVEL": "PHB",
+    }
+    mismatches = {
+        name: (os.environ.get(name), value)
+        for name, value in expected.items()
+        if os.environ.get(name) != value
+    }
+    if mismatches:
+        raise ValueError(f"multinode HSDP/IB environment mismatch: {mismatches}")
+    if "NCCL_DMABUF_ENABLE" in os.environ:
+        raise ValueError("NCCL_DMABUF_ENABLE must remain unset for PHB peer-memory GDR")
+    hca_roster = _required_env("NCCL_IB_HCA").split(",")
+    if not hca_roster or len(hca_roster) != len(set(hca_roster)):
+        raise ValueError("NCCL_IB_HCA must contain unique HCA ports")
+    expected_uverbs = int(_required_env("N0_TRACK32_EXPECTED_IB_UVERBS"))
+    if expected_uverbs != len(hca_roster):
+        raise ValueError("NCCL HCA roster differs from required uverbs count")
+    _require_rccl_network_plugin()
+    _require_character_device(Path("/dev/infiniband/rdma_cm"))
+    for index in range(expected_uverbs):
+        _require_character_device(Path(f"/dev/infiniband/uverbs{index}"))
+    for index, entry in enumerate(hca_roster):
+        _require_hca_binding(entry, uverbs_index=index)
 
 
 def _require_initial_checkpoint(path: Path, expected_sha256: str) -> dict[str, object]:
@@ -339,9 +474,21 @@ def run_preflight() -> dict[str, object]:
         "run_role": _required_env("N0_TRACK32_RUN_ROLE"),
         "world_size": int(_required_env("N0_TRACK32_EXPECTED_WORLD_SIZE")),
         "accelerator_profile": _required_env("N0_TRACK32_ACCELERATOR_PROFILE"),
+        "fsdp_topology": os.environ.get("N0_FSDP_TOPOLOGY", "global_shard"),
+        "fsdp_shard_size": int(
+            os.environ.get(
+                "N0_FSDP_SHARD_SIZE",
+                _required_env("N0_TRACK32_EXPECTED_WORLD_SIZE"),
+            )
+        ),
+        "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+        "nccl_net_gdr_level": os.environ.get("NCCL_NET_GDR_LEVEL"),
+        "nccl_dmabuf_enable": os.environ.get("NCCL_DMABUF_ENABLE"),
+        "nccl_net_plugin": os.environ.get("NCCL_NET_PLUGIN"),
+        "rccl_plugin_sha256": os.environ.get("N0_TRACK32_RCCL_PLUGIN_SHA256"),
         "tactile_profile": "vision_only",
         "tactile_mode": "disabled",
-        "action_route": "end_pose_base8_wxyz_to_ee10_to_ee20_mask_0_9",
+        "action_route": "end_pose_base8_xyzw_to_ee10_to_ee20_mask_0_9",
         "train_view_sha256": artifacts.train_view.view_sha256,
         "validation_view_sha256": (
             None

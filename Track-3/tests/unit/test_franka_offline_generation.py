@@ -5,14 +5,20 @@ import copy
 import numpy as np
 import pytest
 import torch
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    WanAttentionBlock,
+    WanCausalConv3d,
+)
 
 from n0_twam.evaluation.franka_offline_generation import (
     _target_action_rows,
     _uint8_tiles,
 )
 from n0_twam.integrations.worldarena.franka_policy import DirectN0FrankaBackend
-from n0_twam.models.utils import _install_wan_conv3d_fallback
+from n0_twam.models.utils import (
+    _install_wan_attention_fallback,
+    _install_wan_conv3d_fallback,
+)
 
 
 def test_uint8_tiles_splits_canonical_camera_order() -> None:
@@ -91,3 +97,16 @@ def test_wan_conv3d_fallback_matches_native_cpu(with_cache: bool) -> None:
     actual = fallback(inputs, cache)
 
     torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_wan_attention_fallback_matches_sdpa_cpu() -> None:
+    torch.manual_seed(11)
+    native = WanAttentionBlock(8).float()
+    fallback = copy.deepcopy(native)
+    inputs = torch.randn(2, 8, 3, 4, 5)
+
+    expected = native(inputs)
+    _install_wan_attention_fallback(fallback)
+    actual = fallback(inputs)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

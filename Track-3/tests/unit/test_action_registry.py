@@ -14,6 +14,7 @@ def test_builtin_action_codecs_are_registered_explicitly() -> None:
     assert list_action_codecs() == (
         "ee20_absee",
         "ee20_pi05",
+        "qpos14_joint_absolute_v1",
         "qpos8_next_step",
     )
 

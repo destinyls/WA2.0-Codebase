@@ -15,10 +15,20 @@ from typing import Iterator
 import numpy as np
 import numpy.typing as npt
 
+from .franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
+)
 from .franka_manifest import canonical_sha256
 from .franka_policy import FrankaActionBackend, FrankaSafetyConfig, Policy
+from .franka_realtime import (
+    OFFICIAL_FRANKA_CONTROL_HZ,
+    require_franka_realtime_pass,
+    summarize_franka_policy_latency,
+)
 
-REPLAY_SCHEMA_VERSION = 1
+REPLAY_SCHEMA_VERSION = 3
 _OBSERVATION_KEYS = frozenset(
     ("cam_high", "cam_left_wrist", "left_end_pose", "joint_qpos")
 )
@@ -226,6 +236,9 @@ def run_franka_policy_replay(
     steps: int,
     output: Path,
     backend: FrankaActionBackend | None = None,
+    control_hz: float = OFFICIAL_FRANKA_CONTROL_HZ,
+    require_realtime: bool = False,
+    minimum_refill_samples: int = 2,
 ) -> dict[str, object]:
     """Run a perfect-proprioception replay and publish a fail-closed receipt.
 
@@ -255,6 +268,7 @@ def run_franka_policy_replay(
     actions: list[list[float]] = []
     intervention_count = 0
     infer_times_ms: list[float] = []
+    policy_timings: list[dict[str, object]] = []
     with _frozen_config(config_snapshot) as frozen_config:
         policy = Policy(str(frozen_config), backend=backend)
         policy.reset({"prompt": prompt})
@@ -282,7 +296,9 @@ def run_franka_policy_replay(
                     or metadata.get("action_format") != "end_pose_base"
                     or metadata.get("action_dim") != 8
                     or metadata.get("chunk_size") != 1
-                    or metadata.get("quaternion_order") != "wxyz"
+                    or metadata.get("quaternion_order") != FRANKA_QUATERNION_ORDER
+                    or metadata.get("wire_action_schema") != FRANKA_ACTION_SCHEMA
+                    or metadata.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
                     or metadata.get("tactile_mode") != "disabled"
                     or type(metadata.get("safety_intervened")) is not bool
                     or type(metadata.get("safety_intervention_count")) is not int
@@ -301,9 +317,30 @@ def run_franka_policy_replay(
                 infer_ms = timing.get("infer_ms")
                 if not isinstance(infer_ms, (int, float)) or not np.isfinite(infer_ms):
                     raise ValueError("Policy replay timing must be finite")
+                required_timing = {
+                    "kind",
+                    "infer_ms",
+                    "input_ms",
+                    "grounding_ms",
+                    "generation_ms",
+                    "postprocess_ms",
+                    "grounded",
+                    "generated",
+                    "queue_depth_after",
+                }
+                if set(timing) != required_timing:
+                    raise ValueError("Policy replay timing fields differ from schema")
+                if (
+                    type(timing.get("grounded")) is not bool
+                    or type(timing.get("generated")) is not bool
+                    or type(timing.get("queue_depth_after")) is not int
+                    or int(timing["queue_depth_after"]) < 0
+                ):
+                    raise ValueError("Policy replay timing metadata is invalid")
                 actions.append([float(value) for value in action[0]])
                 intervention_count += int(metadata["safety_intervention_count"])
                 infer_times_ms.append(float(infer_ms))
+                policy_timings.append(dict(timing))
                 pose7 = action[0, :7].copy()
                 qpos8[-1] = action[0, 7]
                 previous_pose8 = action[0].copy()
@@ -312,6 +349,13 @@ def run_franka_policy_replay(
 
     _require_unchanged(config_snapshot, label="replay config")
     _require_unchanged(observation_snapshot, label="replay observation")
+    realtime_assessment = summarize_franka_policy_latency(
+        policy_timings,
+        control_hz=control_hz,
+        minimum_refill_samples=minimum_refill_samples,
+    )
+    if require_realtime:
+        require_franka_realtime_pass(realtime_assessment)
     core: dict[str, object] = {
         "schema_version": REPLAY_SCHEMA_VERSION,
         "status": "complete",
@@ -326,11 +370,15 @@ def run_franka_policy_replay(
         "steps": steps,
         "action_format": "end_pose_base",
         "action_dim": 8,
-        "quaternion_order": "wxyz",
+        "quaternion_order": FRANKA_QUATERNION_ORDER,
+        "wire_action_schema": FRANKA_ACTION_SCHEMA,
+        "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "tactile_mode": "disabled",
         "safety_intervention_count": intervention_count,
         "mean_infer_ms": float(np.mean(infer_times_ms)),
         "max_infer_ms": float(np.max(infer_times_ms)),
+        "policy_timings": policy_timings,
+        "realtime_assessment": realtime_assessment,
         "actions": actions,
     }
     receipt = {**core, "replay_identity_sha256": canonical_sha256(core)}

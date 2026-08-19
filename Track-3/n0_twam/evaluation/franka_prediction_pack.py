@@ -24,6 +24,9 @@ _METADATA_KEYS = frozenset(
         "seed",
         "run_role",
         "prediction_mode",
+        "wire_action_schema",
+        "derived_action_schema",
+        "quaternion_order",
     )
 )
 _ARRAY_KEYS = frozenset(

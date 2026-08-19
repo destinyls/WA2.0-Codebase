@@ -26,6 +26,7 @@ One server instance serves ONE task; run several instances for several tasks:
     TWAM_SERVE_POOL=/path/to/pools/my_tasks TWAM_SERVE_TASK=my_task \\
       python -m n0_twam.n0_twam_server --config-name multitask_server --port 29601
 """
+
 import json
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ from .twam_posttrain_server_cfg import twam_posttrain_server_cfg
 
 # ───────── EDIT ME (each value can also be set via the env var) ─────────
 _POOL = Path(os.environ.get("TWAM_SERVE_POOL", "/path/to/pools/my_tasks"))
-_TASK = os.environ.get("TWAM_SERVE_TASK", "my_task")   # repo name under <pool>/train/
+_TASK = os.environ.get("TWAM_SERVE_TASK", "my_task")  # repo name under <pool>/train/
 _ACTION_MODE = os.environ.get("TWAM_SERVE_ACTION_MODE", "absee")  # "absee" | "delta"
 _BUNDLE = os.environ.get("TWAM_SERVE_BUNDLE", "/path/to/serve-bundle")
 _SAVE_ROOT = os.environ.get("TWAM_SERVE_OUT", "/path/to/serve-output")
@@ -66,10 +67,12 @@ if _POOL.is_dir():
     assert _per_path.is_file(), (
         f"multi-task pool {_POOL} has no {_per_path.name} — per-task stats are "
         "required; the pool-level file is a training-only fallback (see "
-        "script/build_task_pool.py)")
+        "script/build_task_pool.py)"
+    )
     _per = json.loads(_per_path.read_text())
-    assert _TASK in _per, (
-        f"task {_TASK!r} not in {_per_path.name} — available: {sorted(_per)}")
+    assert (
+        _TASK in _per
+    ), f"task {_TASK!r} not in {_per_path.name} — available: {sorted(_per)}"
     s.norm_stat = {"q01": list(_per[_TASK]["q01"]), "q99": list(_per[_TASK]["q99"])}
     s.norm_stat_path = f"{_per_path}[{_TASK}]"
 
@@ -78,14 +81,16 @@ if _POOL.is_dir():
     for _info_path in sorted((_POOL / "train").glob("*/meta/info.json")):
         _repo_info = json.loads(_info_path.read_text())
         _repo_video_keys = [
-            key for key, value in _repo_info["features"].items()
+            key
+            for key, value in _repo_info["features"].items()
             if key.startswith("observation.images.") and value.get("dtype") == "video"
         ]
         _repo_tactile_keys[_info_path.parent.parent.name] = [
             key for key in _repo_video_keys if "tactile" in key
         ]
-    assert _repo_tactile_keys and _TASK in _repo_tactile_keys, (
-        f"task {_TASK!r} has no repository metadata under {_POOL / 'train'}")
+    assert (
+        _repo_tactile_keys and _TASK in _repo_tactile_keys
+    ), f"task {_TASK!r} has no repository metadata under {_POOL / 'train'}"
     _has_tactile = [bool(keys) for keys in _repo_tactile_keys.values()]
     if all(_has_tactile):
         s.tactile_profile = VISION_TACTILE
@@ -98,8 +103,11 @@ if _POOL.is_dir():
     }
 
     _info = json.loads((_repo_meta / "info.json").read_text())
-    _video_keys = [k for k, v in _info["features"].items()
-                   if k.startswith("observation.images.") and v.get("dtype") == "video"]
+    _video_keys = [
+        k
+        for k, v in _info["features"].items()
+        if k.startswith("observation.images.") and v.get("dtype") == "video"
+    ]
     s.obs_cam_keys = [k for k in _video_keys if "tactile" not in k]
     s.tactile_keys = [k for k in _video_keys if "tactile" in k]
     s.tactile_sensor_id_map = {k: i for i, k in enumerate(s.tactile_keys)}
@@ -122,8 +130,7 @@ if _POOL.is_dir():
         _inverse[_j] = _i
     s.inverse_used_action_channel_ids = _inverse
 
-    _task_row = json.loads(
-        (_repo_meta / "tasks.jsonl").read_text().splitlines()[0])
+    _task_row = json.loads((_repo_meta / "tasks.jsonl").read_text().splitlines()[0])
     s.prompt = _task_row["task"]
     s.eval_prompt = s.prompt
 else:  # keep import safe pre-data-prep; runtime guards refuse the placeholder
@@ -137,14 +144,17 @@ assert len(s.norm_stat["q01"]) == 20 and len(s.norm_stat["q99"]) == 20
 if _POOL.is_dir():
     assert s.obs_cam_keys, f"no camera video keys found in {_repo_meta}/info.json"
     if s.tactile_profile == VISION_TACTILE:
-        assert s.tactile_keys, \
-            f"vision_tactile task has no tactile video keys in {_repo_meta}/info.json"
+        assert (
+            s.tactile_keys
+        ), f"vision_tactile task has no tactile video keys in {_repo_meta}/info.json"
     # the selected stats must be the task's own, never the pool envelope
     _pool_file = _POOL / f"{_NORM_NAME}.json"
     if _pool_file.is_file():
         _env = json.loads(_pool_file.read_text())
-        assert s.norm_stat["q01"] != _env["q01"] or s.norm_stat["q99"] != _env["q99"] \
-            or len(_per) == 1, \
-            "per-task norm equals the pool envelope — wrong stats wired"
+        assert (
+            s.norm_stat["q01"] != _env["q01"]
+            or s.norm_stat["q99"] != _env["q99"]
+            or len(_per) == 1
+        ), "per-task norm equals the pool envelope — wrong stats wired"
 
 twam_multitask_server_cfg = s

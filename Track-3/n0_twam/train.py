@@ -31,7 +31,6 @@ from distributed.fsdp import (
 )
 from distributed.util import (
     _configure_model,
-    dist_mean,
     dist_mean_and_max,
     init_distributed,
 )
@@ -55,7 +54,7 @@ from utils import (
     sample_timestep_id,
     data_seq_to_patch,
     warmup_constant_lambda,
-    FlowMatchScheduler
+    FlowMatchScheduler,
 )
 
 from dataset import MultiLatentLeRobotDataset, BucketedDistributedBatchSampler
@@ -104,6 +103,8 @@ from n0_twam.checkpointing.strict_checkpoint_snapshot import (
 )
 from n0_twam.checkpointing.training_lineage import (
     load_validated_action_migration_report,
+    load_validated_action_migration_report_for_contract,
+    validate_action_migration_report_for_contract,
     validate_stage_a_parent_checkpoint,
 )
 from n0_twam.configs.twam_track31_univtac_cfg import (
@@ -137,13 +138,17 @@ from n0_twam.distributed.attention_schedule import (
 )
 import gc
 
-
 _MOT_CONFIG_OVERRIDE_FIELDS = (
     *TRACK31_TRANSFORMER_TACTILE_FIELDS,
+    "instantiate_local_tactile",
     "use_contact_gate",
     "contact_gate_layers",
     "contact_gate_heads",
     "contact_gate_stop_grad",
+    "use_wrench_conditioner",
+    "instantiate_wrench_conditioner",
+    "wrench_arm_count",
+    "wrench_max_frames",
 )
 _INT64_MIN = -(1 << 63)
 _INT64_MAX = (1 << 63) - 1
@@ -170,6 +175,290 @@ def _build_mot_config_overrides(
         for field in _MOT_CONFIG_OVERRIDE_FIELDS
         if field in loader_kwargs
     }
+
+
+def _validate_strict_resume_training_lineage(
+    *,
+    current_training_lineage: Mapping[str, object] | None,
+    sidecars: tuple[tuple[str, Mapping[str, object]], ...],
+) -> None:
+    """Require exact lineage equality for new checkpoints, preserving legacy."""
+
+    if current_training_lineage is None:
+        return
+    if not isinstance(current_training_lineage, Mapping):
+        raise ValueError("config.training_lineage must be a mapping")
+    expected = dict(current_training_lineage)
+    for label, payload in sidecars:
+        if payload.get("training_lineage") != expected:
+            raise ValueError(f"{label} training_lineage does not match current config")
+
+
+def _validate_agilex_strict_resume_recipe(
+    *,
+    config: object,
+    sidecars: tuple[tuple[str, Mapping[str, object]], ...],
+) -> None:
+    """Reject AgileX recipe/run-role drift without changing legacy runs."""
+
+    if str(getattr(config, "dataset_adapter", "")) != ("worldarena_agilex_qpos14"):
+        return
+    from n0_twam.configs.twam_track3_agilex_recipe import (
+        build_agilex_resume_recipe_contract,
+        validate_agilex_resume_recipe_contract,
+    )
+
+    expected = build_agilex_resume_recipe_contract(config)
+    for label, payload in sidecars:
+        lineage = payload.get("training_lineage")
+        if not isinstance(lineage, Mapping):
+            raise ValueError(f"{label} has no AgileX training_lineage")
+        try:
+            validate_agilex_resume_recipe_contract(
+                lineage.get("resume_recipe_contract"),
+                current=config,
+            )
+        except ValueError as error:
+            raise ValueError(f"{label} AgileX resume recipe is invalid") from error
+    train_meta = dict(sidecars).get("train metadata")
+    if train_meta is None or train_meta.get("run_role") != expected["run_role"]:
+        raise ValueError("train metadata AgileX run_role differs from current config")
+
+
+def _validate_initial_action_migration_report(
+    *,
+    report: Mapping[str, object],
+    released_transformer_identity: Mapping[str, object],
+    released_transformer_sha256: str,
+    config: object,
+    action_codec: object,
+) -> dict[str, object]:
+    """Bind the in-memory migration plan to its audited released source."""
+
+    report_sha256 = validate_sha256(
+        report.get("source_checkpoint_sha256"),
+        label="migration source checkpoint SHA256",
+    )
+    if report_sha256 != released_transformer_sha256:
+        raise ValueError(
+            "loaded released transformer does not match "
+            "N0_RELEASED_TRANSFORMER_SHA256"
+        )
+    if released_transformer_identity.get("sha256") != report_sha256:
+        raise ValueError(
+            "migration report does not match pre-load transformer identity"
+        )
+    validated = dict(report)
+    validated["source_transformer_identity"] = released_transformer_identity
+    spec = action_codec.spec
+    if spec.name == "qpos14_joint_absolute_v1":
+        validated = validate_action_migration_report_for_contract(
+            validated,
+            source_action_dim=int(getattr(config, "checkpoint_source_action_dim", 20)),
+            source_action_schema=str(
+                getattr(config, "checkpoint_source_action_schema", "ee20_pi05")
+            ),
+            target_action_dim=int(spec.dim),
+            target_action_schema=str(spec.name),
+            initialized_target_only_prefixes=tuple(
+                getattr(config, "initialized_target_only_prefixes", ())
+            ),
+        )
+    return validated
+
+
+def _load_agilex_qpos14_strict_init_migration_report(
+    *,
+    init_from: object,
+    resume_from: object,
+    checkpoint_compatibility: str,
+    config: object,
+    action_codec: object,
+) -> dict[str, object] | None:
+    """Inherit the original 20D-to-qpos14 lineage for AgileX Stage-B init."""
+
+    spec = getattr(action_codec, "spec", None)
+    if (
+        not init_from
+        or resume_from
+        or checkpoint_compatibility != "strict"
+        or str(getattr(config, "dataset_adapter", "")) != "worldarena_agilex_qpos14"
+        or getattr(spec, "name", None) != "qpos14_joint_absolute_v1"
+        or getattr(spec, "dim", None) != 14
+    ):
+        return None
+    report = load_validated_action_migration_report_for_contract(
+        Path(str(init_from)),
+        source_action_dim=20,
+        source_action_schema="ee20_pi05",
+        target_action_dim=14,
+        target_action_schema="qpos14_joint_absolute_v1",
+        initialized_target_only_prefixes=tuple(
+            getattr(config, "initialized_target_only_prefixes", ())
+        ),
+    )
+    if not isinstance(report, dict):
+        raise TypeError("AgileX Stage-B migration report must be a JSON object")
+    return dict(report)
+
+
+def _require_tensor(
+    batch: Mapping[str, object],
+    key: str,
+) -> torch.Tensor:
+    value = batch.get(key)
+    if not torch.is_tensor(value):
+        raise ValueError(f"{key} must be a tensor")
+    return value
+
+
+def _require_bool_shape(
+    batch: Mapping[str, object],
+    key: str,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    value = _require_tensor(batch, key)
+    if value.dtype is not torch.bool or tuple(value.shape) != shape:
+        raise ValueError(f"{key} must have bool shape {shape}")
+    return value
+
+
+def _validate_batch_digests(
+    value: object,
+    *,
+    batch_size: int,
+    label: str,
+) -> None:
+    if not isinstance(value, (list, tuple)) or len(value) != batch_size:
+        raise ValueError(f"{label} must contain one SHA-256 per sample")
+    if any(
+        not isinstance(item, str)
+        or len(item) != 64
+        or any(character not in "0123456789abcdef" for character in item)
+        for item in value
+    ):
+        raise ValueError(f"{label} must contain lowercase SHA-256 digests")
+
+
+def _adapt_agilex_training_batch(
+    batch: Mapping[str, object],
+    *,
+    profile: str,
+    action_dim: int,
+    wrench_arm_count: int,
+    contact_drop_strategy: str,
+) -> dict[str, object]:
+    """Validate and translate one canonical AgileX batch at a single boundary."""
+
+    if contact_drop_strategy != "content_addressed_v1":
+        raise ValueError("AgileX contact_cond_drop must use content_addressed_v1")
+    actions = _require_tensor(batch, "actions")
+    if (
+        actions.dtype is not torch.float32
+        or actions.ndim != 5
+        or actions.shape[1] != action_dim
+        or actions.shape[-1] != 1
+        or not torch.isfinite(actions).all()
+    ):
+        raise ValueError(f"actions must be finite float32 [B,{action_dim},F,H,1]")
+    batch_size, _, frames, horizon, _ = actions.shape
+    temporal = _require_bool_shape(batch, "temporal_valid_mask", (batch_size, frames))
+    action_valid = _require_bool_shape(
+        batch, "action_valid_mask", (batch_size, frames, horizon)
+    )
+    if torch.any(action_valid & ~temporal[:, :, None]):
+        raise ValueError("action_valid_mask cannot enable a temporally invalid frame")
+
+    tactile_available = _require_tensor(batch, "tactile_available_mask")
+    if (
+        tactile_available.dtype is not torch.bool
+        or tactile_available.ndim != 3
+        or tactile_available.shape[:2] != (batch_size, frames)
+    ):
+        raise ValueError("tactile_available_mask must have bool shape [B,F,S]")
+    sensors = int(tactile_available.shape[2])
+    wrench = _require_tensor(batch, "wrench")
+    if (
+        wrench.dtype is not torch.float32
+        or tuple(wrench.shape) != (batch_size, frames, wrench_arm_count, 6)
+        or not torch.isfinite(wrench).all()
+    ):
+        raise ValueError("wrench must be finite float32 " f"[B,F,{wrench_arm_count},6]")
+    wrench_available = _require_bool_shape(
+        batch,
+        "wrench_available_mask",
+        (batch_size, frames, wrench_arm_count),
+    )
+    contact_drop = _require_bool_shape(batch, "contact_cond_drop", (batch_size,))
+    if contact_drop.numel() and not torch.all(contact_drop == contact_drop[0]):
+        raise ValueError(
+            "contact_cond_drop must be uniform within the current batch until "
+            "the model supports heterogeneous contact-drop execution"
+        )
+    _validate_batch_digests(
+        batch.get("repo_route_identity"),
+        batch_size=batch_size,
+        label="repo_route_identity",
+    )
+    _validate_batch_digests(
+        batch.get("temporal_alignment_identity"),
+        batch_size=batch_size,
+        label="temporal_alignment_identity",
+    )
+
+    tactile_keys = ("tactile_global_latent", "tactile_local_latent")
+    present_tactile = [key for key in tactile_keys if key in batch]
+    if present_tactile and len(present_tactile) != len(tactile_keys):
+        raise ValueError("AgileX global/local tactile tensors must appear together")
+    if present_tactile:
+        for key in tactile_keys:
+            tactile = _require_tensor(batch, key)
+            if (
+                not tactile.is_floating_point()
+                or tactile.ndim != 6
+                or tactile.shape[0] != batch_size
+                or tactile.shape[1] != sensors
+                or tactile.shape[3] != frames
+                or not torch.isfinite(tactile).all()
+            ):
+                raise ValueError(f"{key} must be finite [B,S,C,F,H,W]")
+        sensor_ids = _require_tensor(batch, "tactile_sensor_ids")
+        if sensor_ids.dtype is not torch.int64 or tuple(sensor_ids.shape) != (
+            batch_size,
+            sensors,
+        ):
+            raise ValueError("tactile_sensor_ids must be int64 [B,S]")
+    elif tactile_available.any():
+        raise ValueError("tactile availability requires global/local tensors")
+
+    output = dict(batch)
+    output["actions_mask"] = (
+        action_valid[:, None, :, :, None].expand(-1, action_dim, -1, -1, -1).clone()
+    )
+    target_mask = tactile_available & temporal[:, :, None]
+    condition_mask = target_mask & ~contact_drop[:, None, None]
+    wrench_condition_mask = (
+        wrench_available & temporal[:, :, None] & ~contact_drop[:, None, None]
+    )
+    if profile == "vision_only":
+        for key in (
+            *tactile_keys,
+            "tactile_sensor_ids",
+            "wrench",
+        ):
+            output.pop(key, None)
+        output["tactile_available_mask"] = torch.zeros_like(tactile_available)
+        output["wrench_available_mask"] = torch.zeros_like(wrench_available)
+        output["contact_cond_drop"] = torch.ones_like(contact_drop)
+        target_mask = torch.zeros_like(target_mask)
+        condition_mask = torch.zeros_like(condition_mask)
+        wrench_condition_mask = torch.zeros_like(wrench_condition_mask)
+    elif profile not in {"mixed", "vision_tactile"}:
+        raise ValueError(f"unsupported AgileX tactile profile {profile!r}")
+    output["tactile_target_mask"] = target_mask
+    output["tactile_condition_mask"] = condition_mask
+    output["wrench_condition_mask"] = wrench_condition_mask
+    return output
 
 
 def _validate_track31_transformer_contract(
@@ -262,9 +551,7 @@ def _build_track31_transformer_checkpoint_config(
     config_dict["action_schema"] = action_schema
     config_dict["action_dim"] = action_dim
     config_dict["snr_shift"] = float(contract["snr_shift"])
-    config_dict["tactile_latent_channels"] = int(
-        contract["tactile_latent_channels"]
-    )
+    config_dict["tactile_latent_channels"] = int(contract["tactile_latent_channels"])
     return config_dict
 
 
@@ -277,12 +564,8 @@ def _build_track31_tactile_checkpoint_metadata(
         "snr_shift": float(contract["snr_shift"]),
         "use_local_tactile": bool(contract["use_local_tactile"]),
         "max_tactile_streams": int(contract["max_tactile_streams"]),
-        "active_tactile_sensor_count": int(
-            contract["active_tactile_sensor_count"]
-        ),
-        "active_tactile_sensor_ids": list(
-            contract["active_tactile_sensor_ids"]
-        ),
+        "active_tactile_sensor_count": int(contract["active_tactile_sensor_count"]),
+        "active_tactile_sensor_ids": list(contract["active_tactile_sensor_ids"]),
         "tactile_sensor_id_map": dict(contract["tactile_sensor_id_map"]),
         "tactile_in_channels": int(contract["tactile_in_channels"]),
         "tactile_num_tokens": int(contract["tactile_num_tokens"]),
@@ -308,42 +591,53 @@ class Trainer:
     def __init__(self, config, inference_only=False):
         if config.enable_wandb and config.rank == 0 and not inference_only:
             # self-hosted wandb via WANDB_BASE_URL/WANDB_API_KEY; else standard wandb.ai
-            if os.getenv('WANDB_BASE_URL') and os.getenv('WANDB_API_KEY'):
-                wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            if os.getenv("WANDB_BASE_URL") and os.getenv("WANDB_API_KEY"):
+                wandb.login(
+                    host=os.environ["WANDB_BASE_URL"], key=os.environ["WANDB_API_KEY"]
+                )
             self.wandb = wandb
             self.wandb.init(
                 entity=os.getenv("WANDB_TEAM_NAME") or None,
                 project=os.getenv("WANDB_PROJECT", "twam-pretrain"),
                 config=config,
                 mode="online",
-                name=os.getenv("WANDB_RUN_NAME", "twam-train")
+                name=os.getenv("WANDB_RUN_NAME", "twam-train"),
             )
             logger.info("WandB logging enabled")
         self.step = 0
         self.config = config
         self.tactile_profile_contract = validate_tactile_profile_config(config)
-        self.training_lineage = getattr(config, 'training_lineage', None)
+        self.training_lineage = getattr(config, "training_lineage", None)
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
 
         # FlowMatch schedulers — needed by _add_noise / _prepare_input_dict and by
         # inference sampling, so set them up before the (training-only) heavy setup.
-        self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
+        self.train_scheduler_latent = FlowMatchScheduler(
+            shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True
+        )
         self.train_scheduler_latent.set_timesteps(1000, training=True)
-        self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
+        self.train_scheduler_action = FlowMatchScheduler(
+            shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True
+        )
         self.train_scheduler_action.set_timesteps(1000, training=True)
         # symdiff: GlobalTactile becomes a diffusion target. Re-use video snr_shift.
-        self.train_scheduler_tactile = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
+        self.train_scheduler_tactile = FlowMatchScheduler(
+            shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True
+        )
         self.train_scheduler_tactile.set_timesteps(1000, training=True)
-        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+        self.gradient_accumulation_steps = getattr(
+            config, "gradient_accumulation_steps", 1
+        )
         self.track31_artifacts = None
         self.track31_tactile_contract = None
         self.runtime_source_identity = None
         self.checkpoint_invocation_identity = None
-        if resolve_action_codec_name(config) == 'qpos8_next_step':
-            if inference_only and bool(getattr(
-                    config, 'raw_tactile_evaluation', False)):
+        if resolve_action_codec_name(config) == "qpos8_next_step":
+            if inference_only and bool(
+                getattr(config, "raw_tactile_evaluation", False)
+            ):
                 self.track31_artifacts = verify_track31_evaluation_bundle(
                     manifest_path=Path(config.dataset_manifest_path),
                     normalizer_path=Path(config.norm_stat_path),
@@ -351,22 +645,17 @@ class Trainer:
                     dataset_root=Path(config.lerobot_root),
                     evaluation_view_path=Path(config.dataset_view_path),
                     normalizer_source_view_path=Path(
-                        config.normalizer_source_view_path),
+                        config.normalizer_source_view_path
+                    ),
                 )
             else:
                 self.track31_artifacts = verify_track31_training_startup(
                     config,
                     device=self.device,
                 )
-                config.source_manifest_sha256 = (
-                    self.track31_artifacts.manifest_sha256
-                )
-                config.normalizer_sha256 = (
-                    self.track31_artifacts.normalizer_sha256
-                )
-                config.train_view_sha256 = (
-                    self.track31_artifacts.train_view_sha256
-                )
+                config.source_manifest_sha256 = self.track31_artifacts.manifest_sha256
+                config.normalizer_sha256 = self.track31_artifacts.normalizer_sha256
+                config.train_view_sha256 = self.track31_artifacts.train_view_sha256
                 config.validation_view_sha256 = (
                     self.track31_artifacts.validation_view_sha256
                 )
@@ -380,11 +669,11 @@ class Trainer:
                     self.track31_artifacts.tactile_inventory_sha256
                 )
             config.norm_stat = {
-                'q01': list(self.track31_artifacts.action_q01),
-                'q99': list(self.track31_artifacts.action_q99),
+                "q01": list(self.track31_artifacts.action_q01),
+                "q99": list(self.track31_artifacts.action_q99),
             }
-            self.track31_tactile_contract = (
-                build_track31_tactile_training_contract(config)
+            self.track31_tactile_contract = build_track31_tactile_training_contract(
+                config
             )
         (
             self.runtime_source_identity,
@@ -393,7 +682,7 @@ class Trainer:
             formal_track31=(
                 (
                     self.track31_tactile_contract is not None
-                    or bool(getattr(config, 'capture_runtime_provenance', False))
+                    or bool(getattr(config, "capture_runtime_provenance", False))
                 )
                 and not inference_only
             )
@@ -409,73 +698,81 @@ class Trainer:
             return
 
         # Refuse placeholder norm stats (mirror of the server-side guard).
-        _ns = getattr(config, 'norm_stat', None) or {}
-        _q01 = [float(v) for v in _ns.get('q01', [])]
-        _q99 = [float(v) for v in _ns.get('q99', [])]
+        _ns = getattr(config, "norm_stat", None) or {}
+        _q01 = [float(v) for v in _ns.get("q01", [])]
+        _q99 = [float(v) for v in _ns.get("q99", [])]
         if _q01 and _q01 == [-1.0] * len(_q01) and _q99 == [1.0] * len(_q99):
             raise RuntimeError(
-                'norm_stat is the [-1, 1] placeholder — the stats file was '
-                f'missing when the config was imported '
+                "norm_stat is the [-1, 1] placeholder — the stats file was "
+                f"missing when the config was imported "
                 f'(norm_stat_path={getattr(config, "norm_stat_path", None)!r}). '
-                'Compute the norm stats (script/build_task_pool.py) before training.')
+                "Compute the norm stats (script/build_task_pool.py) before training."
+            )
         # Load models
         logger.info("Loading models...")
 
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
-        resume_from = getattr(config, 'resume_from', None)
-        init_from = getattr(config, 'init_from', None)
+        resume_from = getattr(config, "resume_from", None)
+        init_from = getattr(config, "init_from", None)
         if resume_from and init_from:
             raise ValueError("resume_from and init_from are mutually exclusive")
-        strict_training_resume_requested = bool(getattr(
-            config, 'strict_training_resume', False))
+        strict_training_resume_requested = bool(
+            getattr(config, "strict_training_resume", False)
+        )
         if (
             strict_training_resume_requested
-            and int(getattr(config, 'load_worker', 0)) != 0
+            and int(getattr(config, "load_worker", 0)) != 0
         ):
             raise ValueError(
                 "strict_training_resume requires load_worker=0 until DataLoader "
-                "worker RNG state is checkpointed")
+                "worker RNG state is checkpointed"
+            )
         if resume_from and not strict_training_resume_requested:
             raise ValueError(
                 "resume_from requires strict_training_resume=True; use "
-                "init_from for weights-only initialization")
+                "init_from for weights-only initialization"
+            )
         checkpoint_source = resume_from or init_from
         load_checkpoint_source = checkpoint_source
-        checkpoint_compatibility = str(getattr(
-            config, 'checkpoint_compatibility', 'strict'))
-        if resume_from and checkpoint_compatibility != 'strict':
+        checkpoint_compatibility = str(
+            getattr(config, "checkpoint_compatibility", "strict")
+        )
+        if resume_from and checkpoint_compatibility != "strict":
             raise ValueError("resume_from requires checkpoint_compatibility='strict'")
         released_transformer_sha256 = None
         released_transformer_identity = None
-        if checkpoint_source and checkpoint_compatibility == 'migrate_action':
+        if checkpoint_source and checkpoint_compatibility == "migrate_action":
             released_transformer_sha256 = validate_sha256(
-                os.environ.get('N0_RELEASED_TRANSFORMER_SHA256'),
-                label='N0_RELEASED_TRANSFORMER_SHA256',
+                os.environ.get("N0_RELEASED_TRANSFORMER_SHA256"),
+                label="N0_RELEASED_TRANSFORMER_SHA256",
             )
             stage_error = None
             if config.rank == 0:
                 try:
                     released_transformer_identity = audit_transformer_checkpoint(
                         Path(checkpoint_source)
-                        / 'transformer'
+                        / "transformer"
                         / TRANSFORMER_WEIGHTS_FILENAME,
-                        expected_action_dim=int(getattr(
-                            config, 'checkpoint_source_action_dim', 0)),
+                        expected_action_dim=int(
+                            getattr(config, "checkpoint_source_action_dim", 0)
+                        ),
                     )
                     if (
-                        released_transformer_identity['sha256']
+                        released_transformer_identity["sha256"]
                         != released_transformer_sha256
                     ):
                         raise ValueError(
                             "released transformer does not match "
-                            "N0_RELEASED_TRANSFORMER_SHA256")
+                            "N0_RELEASED_TRANSFORMER_SHA256"
+                        )
                 except Exception as error:
                     stage_error = error
                     logger.exception("Failed to audit released transformer")
             self._raise_if_checkpoint_stage_failed(
-                stage_error, "released transformer identity stage")
+                stage_error, "released transformer identity stage"
+            )
             if dist.is_initialized():
                 identity_payload = [released_transformer_identity]
                 dist.broadcast_object_list(
@@ -485,27 +782,22 @@ class Trainer:
                 )
                 released_transformer_identity = identity_payload[0]
             if released_transformer_identity is None:
-                raise RuntimeError(
-                    "released transformer audit returned no identity")
+                raise RuntimeError("released transformer audit returned no identity")
         stage_a_parent_contract = None
         runtime_parent_snapshot = None
         if (
             init_from
-            and checkpoint_compatibility == 'strict'
-            and bool(getattr(config, 'inherit_action_migration_report', False))
+            and checkpoint_compatibility == "strict"
+            and bool(getattr(config, "inherit_action_migration_report", False))
         ):
             stage_error = None
             if config.rank == 0:
                 try:
-                    run_role = getattr(config, 'run_role', None)
+                    run_role = getattr(config, "run_role", None)
                     if not isinstance(run_role, str):
-                        raise ValueError(
-                            "Stage B requires a canonical run role"
-                        )
+                        raise ValueError("Stage B requires a canonical run role")
                     if self.track31_artifacts is None:
-                        raise ValueError(
-                            "Stage B has no verified Track 3.1 artifacts"
-                        )
+                        raise ValueError("Stage B has no verified Track 3.1 artifacts")
                     stage_a_parent_contract = validate_stage_a_parent_checkpoint(
                         Path(init_from),
                         expected_run_role=run_role,
@@ -525,22 +817,16 @@ class Trainer:
                 stage_a_parent_contract = parent_payload[0]
             if stage_a_parent_contract is None:
                 raise RuntimeError("Stage A parent lineage audit returned no contract")
-            runtime_lineage = stage_a_parent_contract.get(
-                'runtime_training_lineage'
-            )
+            runtime_lineage = stage_a_parent_contract.get("runtime_training_lineage")
             if not isinstance(runtime_lineage, Mapping):
-                raise RuntimeError(
-                    "Stage A parent audit returned no runtime lineage"
-                )
+                raise RuntimeError("Stage A parent audit returned no runtime lineage")
             self.training_lineage = dict(runtime_lineage)
             config.training_lineage = self.training_lineage
             stage_error = None
             runtime_snapshot_path = None
             if config.rank == 0:
                 try:
-                    parent_sidecars = stage_a_parent_contract.get(
-                        'sidecar_snapshot'
-                    )
+                    parent_sidecars = stage_a_parent_contract.get("sidecar_snapshot")
                     if parent_sidecars is None:
                         raise RuntimeError(
                             "Stage A parent has no stable sidecar snapshot"
@@ -550,12 +836,10 @@ class Trainer:
                         run_root=Path(config.save_root),
                         sidecars=parent_sidecars,
                         transformer_identity=stage_a_parent_contract.get(
-                            'transformer_identity'
+                            "transformer_identity"
                         ),
                     )
-                    runtime_snapshot_path = str(
-                        runtime_parent_snapshot.checkpoint_root
-                    )
+                    runtime_snapshot_path = str(runtime_parent_snapshot.checkpoint_root)
                 except Exception as error:
                     stage_error = error
                     logger.exception(
@@ -576,19 +860,20 @@ class Trainer:
                 raise RuntimeError("Stage A runtime snapshot path is invalid")
             load_checkpoint_source = runtime_snapshot_path
         if load_checkpoint_source:
-            transformer_path = os.path.join(load_checkpoint_source, 'transformer')
+            transformer_path = os.path.join(load_checkpoint_source, "transformer")
             if config.rank == 0:
                 load_kind = "resume" if resume_from else "initialization"
-                logger.info(
-                    f"Loading checkpoint for {load_kind}: {transformer_path}")
+                logger.info(f"Loading checkpoint for {load_kind}: {transformer_path}")
         else:
-            transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
+            transformer_path = os.path.join(
+                config.wan22_pretrained_model_name_or_path, "transformer"
+            )
 
         _loader_kwargs = dict(
             torch_dtype=torch.float32,
-            torch_device='cpu',
+            torch_device="cpu",
             attn_mode="flex",
-            target_action_dim=int(getattr(config, 'action_dim', 30)),
+            target_action_dim=int(getattr(config, "action_dim", 30)),
             patch_size=tuple(config.patch_size),
             max_tactile_streams=int(config.max_tactile_streams),
             tactile_in_channels=int(config.tactile_in_channels),
@@ -597,29 +882,52 @@ class Trainer:
             # LocalTactile cross-attn branch. The released pretrain checkpoint has
             # it OFF; the post-train config flips it True (built zero-init on
             # resume). Default False = match the released checkpoint.
-            use_local_tactile=bool(getattr(config, 'use_local_tactile', False)),
+            use_local_tactile=bool(getattr(config, "use_local_tactile", False)),
+            instantiate_local_tactile=bool(
+                getattr(
+                    config,
+                    "instantiate_local_tactile",
+                    getattr(config, "use_local_tactile", False),
+                )
+            ),
             # opt-in predictive-contact gate (defaults OFF -> base ckpts unchanged;
             # passed as from_pretrained kwarg so it overrides the ckpt config when
             # resuming a checkpoint whose config predates the gate).
-            use_contact_gate=bool(getattr(config, 'use_contact_gate', False)),
-            contact_gate_layers=int(getattr(config, 'contact_gate_layers', 2)),
-            contact_gate_heads=int(getattr(config, 'contact_gate_heads', 8)),
-            contact_gate_stop_grad=bool(getattr(config, 'contact_gate_stop_grad', True)),
+            use_contact_gate=bool(getattr(config, "use_contact_gate", False)),
+            contact_gate_layers=int(getattr(config, "contact_gate_layers", 2)),
+            contact_gate_heads=int(getattr(config, "contact_gate_heads", 8)),
+            contact_gate_stop_grad=bool(
+                getattr(config, "contact_gate_stop_grad", True)
+            ),
+            use_wrench_conditioner=bool(
+                getattr(config, "use_wrench_conditioner", False)
+            ),
+            instantiate_wrench_conditioner=bool(
+                getattr(
+                    config,
+                    "instantiate_wrench_conditioner",
+                    getattr(config, "use_wrench_conditioner", False),
+                )
+            ),
+            wrench_arm_count=int(getattr(config, "wrench_arm_count", 2)),
+            wrench_max_frames=int(getattr(config, "wrench_max_frames", 64)),
         )
         _mot_overrides = {}
-        if bool(getattr(config, 'use_mot', False)):
+        if bool(getattr(config, "use_mot", False)):
             # Mixture-of-Transformers: 3 per-modality experts warm-started from the
             # shared backbone. Cross-attn / warm-start experts are config-overridable.
             # Built in bf16: an fp32 3-expert build on every rank OOMs the container
             # memory cgroup. (Proper fp32-master via meta-init is a later optimization.)
             _mot_kwargs = dict(_loader_kwargs)
-            _mot_kwargs['torch_dtype'] = torch.bfloat16
+            _mot_kwargs["torch_dtype"] = torch.bfloat16
             if checkpoint_source:
                 # Resuming: transformer_path is a SAVED MoT checkpoint (is_mot in its
                 # config.json). Load it directly (rebuild saved expert structure +
                 # strict weights) — do NOT warm-start from a legacy backbone.
                 if config.rank == 0:
-                    logger.info(f"Resuming MoT via load_mot_checkpoint: {transformer_path}")
+                    logger.info(
+                        f"Resuming MoT via load_mot_checkpoint: {transformer_path}"
+                    )
                 # Post-training may flip on modules the pretrain ckpt config lacks
                 # (use_local_tactile / use_contact_gate): pass them as overrides so
                 # the branch is built (zero-init) and its absent-in-ckpt weights are
@@ -630,60 +938,85 @@ class Trainer:
                 stage_error = None
                 try:
                     self.transformer = load_mot_checkpoint(
-                        transformer_path, torch_dtype=torch.bfloat16,
-                        torch_device='cpu', attn_mode='flex',
+                        transformer_path,
+                        torch_dtype=torch.bfloat16,
+                        torch_device="cpu",
+                        attn_mode="flex",
                         config_overrides=None if resume_from else _mot_overrides,
                         compatibility=checkpoint_compatibility,
-                        target_action_dim=int(getattr(config, 'action_dim', 30)),
-                        action_init_seed=int(getattr(config, 'action_init_seed', 0)),
+                        target_action_dim=int(getattr(config, "action_dim", 30)),
+                        action_init_seed=int(getattr(config, "action_init_seed", 0)),
                         expected_source_action_dim=getattr(
-                            config, 'checkpoint_source_action_dim', None),
+                            config, "checkpoint_source_action_dim", None
+                        ),
                         expected_source_action_schema=getattr(
-                            config, 'checkpoint_source_action_schema', None),
+                            config, "checkpoint_source_action_schema", None
+                        ),
                         target_action_schema=self.action_codec.spec.name,
-                        adopt_missing_action_schema=bool(getattr(
-                            config, 'adopt_missing_action_schema', False)),
+                        adopt_missing_action_schema=bool(
+                            getattr(config, "adopt_missing_action_schema", False)
+                        ),
                         expected_checkpoint_sha256=getattr(
-                            config, 'expected_init_transformer_sha256', None))
+                            config, "expected_init_transformer_sha256", None
+                        ),
+                    )
                     if resume_from:
-                        for field in ('action_dim', 'use_contact_gate'):
-                            saved_value = getattr(
-                                self.transformer.config, field, None)
+                        for field in (
+                            "action_dim",
+                            "use_contact_gate",
+                            "instantiate_local_tactile",
+                            "use_wrench_conditioner",
+                            "instantiate_wrench_conditioner",
+                            "wrench_arm_count",
+                            "wrench_max_frames",
+                        ):
+                            saved_value = getattr(self.transformer.config, field, None)
                             desired_value = getattr(config, field, None)
                             if saved_value != desired_value:
                                 raise ValueError(
                                     f"resume config mismatch for {field}: "
                                     f"checkpoint={saved_value!r} "
-                                    f"config={desired_value!r}")
+                                    f"config={desired_value!r}"
+                                )
                 except Exception as error:
                     stage_error = error
                     logger.exception("Failed to load MoT checkpoint")
                 self._raise_if_checkpoint_stage_failed(
-                    stage_error, "transformer load stage")
+                    stage_error, "transformer load stage"
+                )
             else:
                 if config.rank == 0:
                     logger.info("Building Mixture-of-Transformers (MoT) model (bf16).")
                 self.transformer = load_mot_transformer(
                     transformer_path,
-                    mot_expert_ffn_dim=getattr(config, 'mot_expert_ffn_dim', None),
-                    mot_expert_hidden_dim=getattr(config, 'mot_expert_hidden_dim', None),
-                    mot_cross_attn_experts=tuple(getattr(
-                        config, 'mot_cross_attn_experts', ("video", "action"))),
-                    mot_warmstart_experts=tuple(getattr(
-                        config, 'mot_warmstart_experts', ("video", "action", "tactile"))),
+                    mot_expert_ffn_dim=getattr(config, "mot_expert_ffn_dim", None),
+                    mot_expert_hidden_dim=getattr(
+                        config, "mot_expert_hidden_dim", None
+                    ),
+                    mot_cross_attn_experts=tuple(
+                        getattr(config, "mot_cross_attn_experts", ("video", "action"))
+                    ),
+                    mot_warmstart_experts=tuple(
+                        getattr(
+                            config,
+                            "mot_warmstart_experts",
+                            ("video", "action", "tactile"),
+                        )
+                    ),
                     **_mot_kwargs,
                 )
         else:
-            if str(getattr(config, 'checkpoint_compatibility', 'strict')) != 'strict':
+            if str(getattr(config, "checkpoint_compatibility", "strict")) != "strict":
                 raise ValueError(
-                    "checkpoint action migration currently requires use_mot=True")
+                    "checkpoint action migration currently requires use_mot=True"
+                )
             self.transformer = load_transformer(transformer_path, **_loader_kwargs)
 
         if stage_a_parent_contract is not None:
             stage_error = None
             try:
                 verified_parent_config = stage_a_parent_contract.get(
-                    'transformer_config'
+                    "transformer_config"
                 )
                 if not isinstance(verified_parent_config, Mapping):
                     raise RuntimeError(
@@ -692,20 +1025,20 @@ class Trainer:
                 validate_loaded_transformer_architecture(
                     self.transformer.config,
                     verified_config=verified_parent_config,
-                    overrides={**_mot_overrides, 'attn_mode': 'flex'},
+                    overrides={**_mot_overrides, "attn_mode": "flex"},
                 )
                 if config.rank == 0:
                     post_load_parent_identity = audit_transformer_checkpoint(
                         Path(load_checkpoint_source)
-                        / 'transformer'
+                        / "transformer"
                         / TRANSFORMER_WEIGHTS_FILENAME,
                         expected_action_dim=8,
                     )
                     validate_transformer_identity_match(
-                        stage_a_parent_contract.get('transformer_identity'),
+                        stage_a_parent_contract.get("transformer_identity"),
                         post_load_parent_identity,
                         expected_action_dim=8,
-                        label='post-load Stage A parent',
+                        label="post-load Stage A parent",
                     )
                     revalidated_parent = validate_stage_a_parent_checkpoint(
                         Path(init_from),
@@ -714,20 +1047,15 @@ class Trainer:
                             self.track31_artifacts.to_json_dict()
                         ),
                     )
-                    if (
-                        revalidated_parent.get('runtime_training_lineage')
-                        != stage_a_parent_contract.get(
-                            'runtime_training_lineage'
-                        )
-                    ):
+                    if revalidated_parent.get(
+                        "runtime_training_lineage"
+                    ) != stage_a_parent_contract.get("runtime_training_lineage"):
                         raise ValueError(
                             "Stage A parent changed across transformer load"
                         )
             except Exception as error:
                 stage_error = error
-                logger.exception(
-                    "Stage A parent changed while loading transformer"
-                )
+                logger.exception("Stage A parent changed while loading transformer")
             self._raise_if_checkpoint_stage_failed(
                 stage_error, "post-load Stage A parent identity stage"
             )
@@ -757,52 +1085,84 @@ class Trainer:
             )
 
         self.training_execution_contract = build_training_execution_contract(
-            max_latent_frames=int(getattr(config, 'max_latent_frames', 0)),
-            gradient_accumulation_steps=int(
-                self.gradient_accumulation_steps),
-            batch_size=int(getattr(config, 'batch_size', 1)),
-            load_worker=int(getattr(config, 'load_worker', 0)),
-            num_steps=int(getattr(config, 'num_steps', 0)),
-            lr_schedule=str(getattr(config, 'lr_schedule', 'constant')),
-            warmup_steps=int(getattr(config, 'warmup_steps', 0)),
-            lr_min_ratio=float(getattr(config, 'lr_min_ratio', 0.0)),
+            max_latent_frames=int(getattr(config, "max_latent_frames", 0)),
+            gradient_accumulation_steps=int(self.gradient_accumulation_steps),
+            batch_size=int(getattr(config, "batch_size", 1)),
+            load_worker=int(getattr(config, "load_worker", 0)),
+            num_steps=int(getattr(config, "num_steps", 0)),
+            lr_schedule=str(getattr(config, "lr_schedule", "constant")),
+            warmup_steps=int(getattr(config, "warmup_steps", 0)),
+            lr_min_ratio=float(getattr(config, "lr_min_ratio", 0.0)),
             activation_checkpointing=_activation_checkpointing_enabled(),
             attention_contract=capture_attention_execution_contract(),
         )
         self.action_migration_report = getattr(
-            self.transformer, 'action_migration_report', None)
-        if init_from and checkpoint_compatibility == 'migrate_action':
+            self.transformer, "action_migration_report", None
+        )
+        if init_from and checkpoint_compatibility == "migrate_action":
             stage_error = None
             try:
                 if self.action_migration_report is None:
                     raise ValueError(
-                        "initial action migration did not produce provenance")
-                report_sha256 = validate_sha256(
-                    self.action_migration_report.get('source_checkpoint_sha256'),
-                    label='migration source checkpoint SHA256',
+                        "initial action migration did not produce provenance"
+                    )
+                self.action_migration_report = (
+                    _validate_initial_action_migration_report(
+                        report=self.action_migration_report,
+                        released_transformer_identity=(released_transformer_identity),
+                        released_transformer_sha256=(released_transformer_sha256),
+                        config=config,
+                        action_codec=self.action_codec,
+                    )
                 )
-                if report_sha256 != released_transformer_sha256:
-                    raise ValueError(
-                        "loaded released transformer does not match "
-                        "N0_RELEASED_TRANSFORMER_SHA256")
-                if released_transformer_identity['sha256'] != report_sha256:
-                    raise ValueError(
-                        "migration report does not match pre-load "
-                        "transformer identity")
-                self.action_migration_report = dict(
-                    self.action_migration_report)
-                self.action_migration_report[
-                    'source_transformer_identity'
-                ] = released_transformer_identity
             except Exception as error:
                 stage_error = error
                 logger.exception("Failed to validate action migration provenance")
             self._raise_if_checkpoint_stage_failed(
-                stage_error, "action migration provenance stage")
-        if stage_a_parent_contract is not None:
-            inherited_report = stage_a_parent_contract.get(
-                'action_migration_report'
+                stage_error, "action migration provenance stage"
             )
+        agilex_stage_b_init = (
+            bool(init_from)
+            and not resume_from
+            and checkpoint_compatibility == "strict"
+            and str(getattr(config, "dataset_adapter", ""))
+            == "worldarena_agilex_qpos14"
+            and self.action_codec.spec.name == "qpos14_joint_absolute_v1"
+            and int(self.action_codec.spec.dim) == 14
+        )
+        if agilex_stage_b_init:
+            stage_error = None
+            inherited_report = None
+            if config.rank == 0:
+                try:
+                    inherited_report = _load_agilex_qpos14_strict_init_migration_report(
+                        init_from=init_from,
+                        resume_from=resume_from,
+                        checkpoint_compatibility=checkpoint_compatibility,
+                        config=config,
+                        action_codec=self.action_codec,
+                    )
+                except Exception as error:
+                    stage_error = error
+                    logger.exception(
+                        "Failed to inherit AgileX Stage-B migration provenance"
+                    )
+            self._raise_if_checkpoint_stage_failed(
+                stage_error, "AgileX Stage-B migration provenance stage"
+            )
+            if dist.is_initialized():
+                migration_payload = [inherited_report]
+                dist.broadcast_object_list(
+                    migration_payload,
+                    src=0,
+                    device=self.device,
+                )
+                inherited_report = migration_payload[0]
+            if not isinstance(inherited_report, dict):
+                raise RuntimeError("AgileX Stage-B migration audit returned no report")
+            self.action_migration_report = dict(inherited_report)
+        if stage_a_parent_contract is not None:
+            inherited_report = stage_a_parent_contract.get("action_migration_report")
             if not isinstance(inherited_report, dict):
                 raise ValueError(
                     "Stage A parent lineage has no action migration report"
@@ -813,11 +1173,15 @@ class Trainer:
             stage_error = None
             try:
                 if self.action_codec.spec.name not in {
-                    "qpos8_next_step", "ee20_absee"
+                    "qpos8_next_step",
+                    "qpos14_joint_absolute_v1",
+                    "ee20_absee",
                 }:
                     raise ValueError(
                         "strict_training_resume currently requires "
-                        "qpos8_next_step or ee20_absee")
+                        "qpos8_next_step, qpos14_joint_absolute_v1, or "
+                        "ee20_absee"
+                    )
                 if self.action_codec.spec.name == "qpos8_next_step":
                     self.action_migration_report = (
                         load_validated_action_migration_report(
@@ -825,8 +1189,33 @@ class Trainer:
                             target_action_schema=self.action_codec.spec.name,
                         )
                     )
-                elif str(getattr(config, 'dataset_adapter', '')) != (
-                    'worldarena_franka_ee10'
+                elif self.action_codec.spec.name == ("qpos14_joint_absolute_v1"):
+                    self.action_migration_report = (
+                        load_validated_action_migration_report_for_contract(
+                            Path(resume_from),
+                            source_action_dim=int(
+                                getattr(config, "migration_source_action_dim", 20)
+                            ),
+                            source_action_schema=str(
+                                getattr(
+                                    config,
+                                    "migration_source_action_schema",
+                                    "ee20_pi05",
+                                )
+                            ),
+                            target_action_dim=14,
+                            target_action_schema=self.action_codec.spec.name,
+                            initialized_target_only_prefixes=tuple(
+                                getattr(
+                                    config,
+                                    "initialized_target_only_prefixes",
+                                    ("agilex_wrench_",),
+                                )
+                            ),
+                        )
+                    )
+                elif str(getattr(config, "dataset_adapter", "")) != (
+                    "worldarena_franka_ee10"
                 ):
                     raise ValueError(
                         "ee20_absee strict resume is restricted to the Franka adapter"
@@ -834,18 +1223,21 @@ class Trainer:
             except Exception as error:
                 stage_error = error
                 logger.exception(
-                    "Failed to validate resume action migration provenance")
+                    "Failed to validate resume action migration provenance"
+                )
             self._raise_if_checkpoint_stage_failed(
-                stage_error, "resume migration provenance stage")
+                stage_error, "resume migration provenance stage"
+            )
 
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
         self.trainability_contract = configure_parameter_trainability(
             self.transformer,
-            tactile_mode=str(getattr(config, 'tactile_mode', 'enabled')),
-            freeze_tactile_parameters=bool(getattr(
-                config, 'freeze_tactile_parameters', False)),
+            tactile_mode=str(getattr(config, "tactile_mode", "enabled")),
+            freeze_tactile_parameters=bool(
+                getattr(config, "freeze_tactile_parameters", False)
+            ),
             tactile_profile=self.tactile_profile_contract.profile,
         )
 
@@ -871,17 +1263,25 @@ class Trainer:
             foreach=False,
         )
 
-        if str(getattr(config, 'lr_schedule', 'constant')) == 'cosine':
+        if str(getattr(config, "lr_schedule", "constant")) == "cosine":
             from utils import warmup_cosine_lambda
+
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
                 lr_lambda=lambda step: warmup_cosine_lambda(
-                    step, warmup_steps=config.warmup_steps,
+                    step,
+                    warmup_steps=config.warmup_steps,
                     total_steps=config.num_steps,
-                    min_ratio=float(getattr(config, 'lr_min_ratio', 0.1))))
+                    min_ratio=float(getattr(config, "lr_min_ratio", 0.1)),
+                ),
+            )
         else:
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer,
-                lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=lambda step: warmup_constant_lambda(
+                    step, warmup_steps=config.warmup_steps
+                ),
+            )
 
         self.data_batches_consumed = 0
         self._pending_rng_state = None
@@ -898,23 +1298,20 @@ class Trainer:
             repo_names=(dataset.repo_name for dataset in train_dataset._datasets),
         )
         if (
-            dataset_profile_contract.profile
-            != self.tactile_profile_contract.profile
+            dataset_profile_contract.profile != self.tactile_profile_contract.profile
             or dataset_profile_contract.per_repo_tactile_keys
             != self.tactile_profile_contract.per_repo_tactile_keys
         ):
             raise ValueError("dataset tactile profile differs from launch contract")
-        _bs = int(getattr(config, 'batch_size', 1))
-        sampler_coverage_mode = str(
-            getattr(config, 'sampler_coverage_mode', 'legacy')
-        )
-        if _bs > 1 or sampler_coverage_mode == 'pad_global':
+        _bs = int(getattr(config, "batch_size", 1))
+        sampler_coverage_mode = str(getattr(config, "sampler_coverage_mode", "legacy"))
+        if _bs > 1 or sampler_coverage_mode == "pad_global":
             # Per-GPU batch>1: the pool is shape-heterogeneous (cameras 1/3,
             # tactile streams 0/2/4) so default_collate cannot stack arbitrary
             # samples. Bucket same-signature samples into batches and shard them
             # equally across ranks (each rank gets the same #batches => no FSDP
             # step desync). Requires the dataset to expose per-sample signatures.
-            if not hasattr(train_dataset, 'sample_signatures'):
+            if not hasattr(train_dataset, "sample_signatures"):
                 raise RuntimeError(
                     "batch_size>1 needs a dataset exposing .sample_signatures "
                     "for shape bucketing (only the pi05-delta dataset does)."
@@ -925,14 +1322,14 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
-                seed=int(getattr(config, 'seed', 42)),
+                seed=int(getattr(config, "seed", 42)),
                 drop_last=True,
                 coverage_mode=sampler_coverage_mode,
                 rank_alignment_mode=str(
-                    getattr(config, 'sampler_rank_alignment', 'contiguous')
+                    getattr(config, "sampler_rank_alignment", "contiguous")
                 ),
-                tasks=getattr(train_dataset, 'sample_tasks', None),
-                sample_ids=getattr(train_dataset, 'sample_ids', None),
+                tasks=getattr(train_dataset, "sample_tasks", None),
+                sample_ids=getattr(train_dataset, "sample_ids", None),
             )
             self.train_sampler = train_batch_sampler
             self.train_loader = DataLoader(
@@ -954,7 +1351,7 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
-                seed=int(getattr(config, 'seed', 42)),
+                seed=int(getattr(config, "seed", 42)),
             )
             self.train_sampler = train_sampler
             self.train_loader = DataLoader(
@@ -968,7 +1365,7 @@ class Trainer:
         # Optional validation set: episode-level held-out repos. Loss-only —
         # never touches the optimizer. Sharded across ranks like training.
         self.val_loader = None
-        val_path = getattr(config, 'val_dataset_path', None)
+        val_path = getattr(config, "val_dataset_path", None)
         if val_path:
             val_config = build_validation_dataset_config(config)
             val_dataset = MultiLatentLeRobotDataset(config=val_config)
@@ -978,12 +1375,12 @@ class Trainer:
                 rank=config.rank,
             )
             self.val_sample_validity = val_sampler.validity_mask
-            raw_sample_ids = getattr(val_dataset, 'sample_ids', None)
+            raw_sample_ids = getattr(val_dataset, "sample_ids", None)
             if raw_sample_ids is not None and len(raw_sample_ids) != len(val_dataset):
                 raise ValueError("validation sample identity inventory is incomplete")
             self.val_sample_seeds = tuple(
                 deterministic_validation_seed(
-                    int(getattr(config, 'seed', 42)),
+                    int(getattr(config, "seed", 42)),
                     (
                         str(raw_sample_ids[index])
                         if raw_sample_ids is not None
@@ -1001,13 +1398,15 @@ class Trainer:
                 num_workers=2,
                 sampler=val_sampler,
             )
-            self.val_interval = int(getattr(config, 'val_interval', 100))
+            self.val_interval = int(getattr(config, "val_interval", 100))
             if config.rank == 0:
-                logger.info(f"Validation set: {len(val_dataset)} segments, "
-                            f"every {self.val_interval} steps")
+                logger.info(
+                    f"Validation set: {len(val_dataset)} segments, "
+                    f"every {self.val_interval} steps"
+                )
 
         if self._pending_sampler_state is not None:
-            if not hasattr(self.train_sampler, 'load_state_dict'):
+            if not hasattr(self.train_sampler, "load_state_dict"):
                 raise ValueError(
                     "resume checkpoint contains sampler state but the runtime "
                     "sampler cannot restore it"
@@ -1022,10 +1421,10 @@ class Trainer:
 
     def _validate_invocation_contract(self) -> dict[str, int | bool]:
         """Validate this process's bounded step range after any strict resume."""
-        raw_num_steps = getattr(self.config, 'num_steps', 0)
+        raw_num_steps = getattr(self.config, "num_steps", 0)
         raw_steps = (
             self.step,
-            getattr(self.config, 'stop_after_step', raw_num_steps),
+            getattr(self.config, "stop_after_step", raw_num_steps),
             raw_num_steps,
         )
         type_flags = tuple(
@@ -1044,8 +1443,7 @@ class Trainer:
         if not dist.is_initialized():
             if not all(type_flags):
                 raise ValueError(
-                    "Track 3.1 invocation requires integer optimizer-step "
-                    "boundaries"
+                    "Track 3.1 invocation requires integer optimizer-step " "boundaries"
                 )
             return build_track31_invocation_contract(
                 start_step=normalized_steps[0],
@@ -1059,8 +1457,7 @@ class Trainer:
             device=self.device,
         )
         gathered_payloads = [
-            torch.empty_like(local_payload)
-            for _ in range(dist.get_world_size())
+            torch.empty_like(local_payload) for _ in range(dist.get_world_size())
         ]
         dist.all_gather(gathered_payloads, local_payload)
         rank_payloads = [
@@ -1095,8 +1492,7 @@ class Trainer:
                 + "; ".join(boundary_errors)
             )
         if any(
-            rank_contract != rank_contracts[0]
-            for rank_contract in rank_contracts[1:]
+            rank_contract != rank_contracts[0] for rank_contract in rank_contracts[1:]
         ):
             raise ValueError(
                 "distributed invocation contract mismatch across ranks: "
@@ -1115,16 +1511,15 @@ class Trainer:
         if self.config.rank == 0:
             try:
                 actual_transformer_identity = audit_transformer_checkpoint(
-                    checkpoint_dir
-                    / 'transformer'
-                    / TRANSFORMER_WEIGHTS_FILENAME,
-                    expected_action_dim=int(getattr(self.config, 'action_dim', 0)),
+                    checkpoint_dir / "transformer" / TRANSFORMER_WEIGHTS_FILENAME,
+                    expected_action_dim=int(getattr(self.config, "action_dim", 0)),
                 )
             except Exception as error:
                 stage_error = error
                 logger.exception("Failed to audit strict-resume transformer")
         self._raise_if_checkpoint_stage_failed(
-            stage_error, "resume transformer identity stage")
+            stage_error, "resume transformer identity stage"
+        )
         if dist.is_initialized():
             identity_payload = [actual_transformer_identity]
             dist.broadcast_object_list(
@@ -1146,9 +1541,7 @@ class Trainer:
         except Exception as error:
             stage_error = error
             logger.exception("Failed to validate strict-resume sidecars")
-        self._raise_if_checkpoint_stage_failed(
-            stage_error, "resume validation stage"
-        )
+        self._raise_if_checkpoint_stage_failed(stage_error, "resume validation stage")
         if resume_payload is None:
             raise RuntimeError("strict-resume validation returned no payload")
         (
@@ -1178,17 +1571,18 @@ class Trainer:
         self._pending_rng_state = rng_state
         logger.info(
             f"Strict resume restored step={self.step}, "
-            f"data_batches_consumed={self.data_batches_consumed}")
+            f"data_batches_consumed={self.data_batches_consumed}"
+        )
 
     def _load_and_validate_resume_sidecars(
-            self, checkpoint_dir, *, actual_transformer_identity):
+        self, checkpoint_dir, *, actual_transformer_identity
+    ):
         """Read every rank-local sidecar before entering a restore collective."""
         optimizer_path = checkpoint_dir / OPTIMIZER_DCP_DIRNAME
         optimizer_metadata_path = optimizer_path / ".metadata"
         if not optimizer_metadata_path.is_file():
             raise FileNotFoundError(
-                "resume checkpoint is incomplete; missing "
-                f"{optimizer_metadata_path}"
+                "resume checkpoint is incomplete; missing " f"{optimizer_metadata_path}"
             )
         strict_snapshot = capture_strict_checkpoint_snapshot(checkpoint_dir)
         completion = strict_snapshot.completion
@@ -1203,9 +1597,23 @@ class Trainer:
             self.config, "track32_artifact_identity", None
         )
         optimizer_inventory_sha256 = state.get("optimizer_inventory_sha256")
-        current_tactile_contract = getattr(
-            self, "tactile_profile_contract", None
+        _validate_strict_resume_training_lineage(
+            current_training_lineage=getattr(self.config, "training_lineage", None),
+            sidecars=(
+                ("train metadata", meta),
+                ("training state", state),
+                ("completion marker", completion),
+            ),
         )
+        _validate_agilex_strict_resume_recipe(
+            config=self.config,
+            sidecars=(
+                ("train metadata", meta),
+                ("training state", state),
+                ("completion marker", completion),
+            ),
+        )
+        current_tactile_contract = getattr(self, "tactile_profile_contract", None)
         current_tactile_profile = (
             None
             if current_tactile_contract is None
@@ -1244,9 +1652,10 @@ class Trainer:
                 != current_tactile_contract.contract_sha256
             ):
                 raise ValueError("strict resume transformer tactile profile mismatch")
-        if current_profile_identity is not None or getattr(
-            self, "runtime_source_identity", None
-        ) is not None:
+        if (
+            current_profile_identity is not None
+            or getattr(self, "runtime_source_identity", None) is not None
+        ):
             validate_checkpoint_runtime_provenance(
                 (
                     ("resume train metadata", meta),
@@ -1256,39 +1665,34 @@ class Trainer:
                 current_runtime_source_identity=self.runtime_source_identity,
             )
         validate_transformer_identity_match(
-            meta.get('transformer_identity'),
+            meta.get("transformer_identity"),
             actual_transformer_identity,
-            expected_action_dim=int(getattr(self.config, 'action_dim', 0)),
-            label='train metadata',
+            expected_action_dim=int(getattr(self.config, "action_dim", 0)),
+            label="train metadata",
         )
         validate_transformer_identity_match(
-            state.get('transformer_identity'),
+            state.get("transformer_identity"),
             actual_transformer_identity,
-            expected_action_dim=int(getattr(self.config, 'action_dim', 0)),
-            label='training state',
+            expected_action_dim=int(getattr(self.config, "action_dim", 0)),
+            label="training state",
         )
         validate_transformer_identity_match(
-            completion.get('transformer_identity'),
+            completion.get("transformer_identity"),
             actual_transformer_identity,
-            expected_action_dim=int(getattr(self.config, 'action_dim', 0)),
-            label='completion marker',
+            expected_action_dim=int(getattr(self.config, "action_dim", 0)),
+            label="completion marker",
         )
         if (
             completion.get("action_schema") != self.action_codec.spec.name
-            or completion.get("optimizer_state_format")
-            != OPTIMIZER_STATE_FORMAT
+            or completion.get("optimizer_state_format") != OPTIMIZER_STATE_FORMAT
             or completion.get("optimizer_inventory_sha256")
             != optimizer_inventory_sha256
-            or completion.get("runtime_signature")
-            != saved_runtime_signature
-            or completion.get("training_execution_contract")
-            != saved_execution_contract
-            or completion.get("training_profile_identity")
-            != saved_profile_identity
-            or completion.get("track32_artifact_identity")
-            != saved_track32_artifacts
-            or completion.get('transformer_identity')
-            != state.get('transformer_identity')
+            or completion.get("runtime_signature") != saved_runtime_signature
+            or completion.get("training_execution_contract") != saved_execution_contract
+            or completion.get("training_profile_identity") != saved_profile_identity
+            or completion.get("track32_artifact_identity") != saved_track32_artifacts
+            or completion.get("transformer_identity")
+            != state.get("transformer_identity")
         ):
             raise ValueError("resume checkpoint completion marker is inconsistent")
         if (
@@ -1299,9 +1703,11 @@ class Trainer:
         if strict_snapshot.world_size != int(self.config.world_size):
             raise ValueError(
                 "resume world_size mismatch: "
-                f"{strict_snapshot.world_size} vs {self.config.world_size}")
+                f"{strict_snapshot.world_size} vs {self.config.world_size}"
+            )
         if strict_snapshot.gradient_accumulation_steps != int(
-                self.gradient_accumulation_steps):
+            self.gradient_accumulation_steps
+        ):
             raise ValueError("resume gradient_accumulation_steps mismatch")
         if state.get("action_schema") != self.action_codec.spec.name:
             raise ValueError("resume training-state action schema mismatch")
@@ -1313,28 +1719,27 @@ class Trainer:
         if meta.get("action_schema") != self.action_codec.spec.name:
             raise ValueError("resume train metadata action schema mismatch")
         if meta.get("training_execution_contract") != saved_execution_contract:
-            raise ValueError(
-                "resume train metadata execution contract is inconsistent")
+            raise ValueError("resume train metadata execution contract is inconsistent")
         if saved_execution_contract != self.training_execution_contract:
             raise ValueError("resume training execution contract mismatch")
         if current_profile_identity is not None:
             if (
                 saved_profile_identity != current_profile_identity
-                or meta.get("training_profile_identity")
-                != current_profile_identity
+                or meta.get("training_profile_identity") != current_profile_identity
             ):
                 raise ValueError("resume Track 3.1 training profile identity mismatch")
         if current_track32_artifacts is not None:
             if (
                 saved_track32_artifacts != current_track32_artifacts
-                or meta.get("track32_artifact_identity")
-                != current_track32_artifacts
+                or meta.get("track32_artifact_identity") != current_track32_artifacts
             ):
                 raise ValueError("resume Track 3.2 artifact identity mismatch")
         saved_sampler_state = meta.get("sampler_state")
         if getattr(self.config, "sampler_coverage_mode", None) == "pad_global":
             if not isinstance(saved_sampler_state, dict):
-                raise ValueError("resume checkpoint is missing pad_global sampler state")
+                raise ValueError(
+                    "resume checkpoint is missing pad_global sampler state"
+                )
             self._pending_sampler_state = saved_sampler_state
         saved_artifacts = meta.get("track31_artifacts")
         current_artifacts = (
@@ -1447,22 +1852,15 @@ class Trainer:
 
     def _validate_optimizer_scheduler_alignment(self, scheduler_state):
         """Reject a DCP optimizer whose LR fields disagree with the scheduler."""
-        base_lrs = [
-            float.fromhex(value) for value in scheduler_state["base_lrs_hex"]
-        ]
-        last_lrs = [
-            float.fromhex(value) for value in scheduler_state["last_lrs_hex"]
-        ]
+        base_lrs = [float.fromhex(value) for value in scheduler_state["base_lrs_hex"]]
+        last_lrs = [float.fromhex(value) for value in scheduler_state["last_lrs_hex"]]
         groups = self.optimizer.param_groups
         if len(groups) != len(base_lrs):
             raise ValueError("restored optimizer LR group count mismatch")
-        for group, base_lr, last_lr in zip(
-            groups, base_lrs, last_lrs, strict=True
-        ):
+        for group, base_lr, last_lr in zip(groups, base_lrs, last_lrs, strict=True):
             if (
                 float(group.get("lr", float("nan"))).hex() != last_lr.hex()
-                or float(group.get("initial_lr", float("nan"))).hex()
-                != base_lr.hex()
+                or float(group.get("initial_lr", float("nan"))).hex() != base_lr.hex()
             ):
                 raise ValueError(
                     "restored optimizer LR fields disagree with scheduler state"
@@ -1483,12 +1881,14 @@ class Trainer:
         if batches_per_epoch <= 0:
             raise ValueError("training dataloader is empty")
         epoch, offset = divmod(self.data_batches_consumed, batches_per_epoch)
-        for sampler in (getattr(self.train_loader, 'batch_sampler', None),
-                        self.train_loader.sampler):
-            if sampler is not None and hasattr(sampler, 'set_epoch'):
+        for sampler in (
+            getattr(self.train_loader, "batch_sampler", None),
+            self.train_loader.sampler,
+        ):
+            if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
                 break
-        if hasattr(self.train_loader.dataset, 'set_epoch'):
+        if hasattr(self.train_loader.dataset, "set_epoch"):
             self.train_loader.dataset.set_epoch(epoch)
         # DataLoader iterator construction consumes the global Torch RNG even
         # with num_workers=0. At an epoch boundary the uninterrupted path
@@ -1517,12 +1917,14 @@ class Trainer:
             # Reset sampler/batch_sampler and iterator when epoch finishes.
             # batch_size>1 uses a bucketed batch_sampler; batch_size==1 uses a
             # plain (Distributed)Sampler. Both expose set_epoch for reshuffle.
-            for _samp in (getattr(self.train_loader, 'batch_sampler', None),
-                          self.train_loader.sampler):
-                if _samp is not None and hasattr(_samp, 'set_epoch'):
-                    next_epoch = getattr(_samp, 'epoch', 0) + 1
+            for _samp in (
+                getattr(self.train_loader, "batch_sampler", None),
+                self.train_loader.sampler,
+            ):
+                if _samp is not None and hasattr(_samp, "set_epoch"):
+                    next_epoch = getattr(_samp, "epoch", 0) + 1
                     _samp.set_epoch(next_epoch)
-                    if hasattr(self.train_loader.dataset, 'set_epoch'):
+                    if hasattr(self.train_loader.dataset, "set_epoch"):
                         self.train_loader.dataset.set_epoch(next_epoch)
                     break
             self.train_loader_iter = iter(self.train_loader)
@@ -1532,60 +1934,62 @@ class Trainer:
 
     def _write_completed_epoch_exposure(self) -> None:
         """Append one verified global sampler plan after an epoch completes."""
-        sampler = getattr(self, 'train_sampler', None)
-        config = getattr(self, 'config', None)
+        sampler = getattr(self, "train_sampler", None)
+        config = getattr(self, "config", None)
         if (
             config is None
-            or getattr(config, 'rank', 0) != 0
+            or getattr(config, "rank", 0) != 0
             or sampler is None
-            or not hasattr(sampler, 'exposure_summary')
+            or not hasattr(sampler, "exposure_summary")
         ):
             return
         payload = dict(sampler.exposure_summary())
         crop_policy = {
-            'policy_id': getattr(
+            "policy_id": getattr(
                 self.config,
-                'crop_window_policy_id',
-                'checkpointed_rng_stream_crop_v1',
+                "crop_window_policy_id",
+                "checkpointed_rng_stream_crop_v1",
             ),
-            'max_latent_frames': int(
-                getattr(self.config, 'max_latent_frames', 0)
-            ),
+            "max_latent_frames": int(getattr(self.config, "max_latent_frames", 0)),
         }
-        payload['crop_window_policy'] = crop_policy
-        payload['crop_window_policy_sha256'] = hashlib.sha256(
+        payload["crop_window_policy"] = crop_policy
+        payload["crop_window_policy_sha256"] = hashlib.sha256(
             json.dumps(
                 crop_policy,
                 allow_nan=False,
-                separators=(',', ':'),
+                separators=(",", ":"),
                 sort_keys=True,
-            ).encode('utf-8')
+            ).encode("utf-8")
         ).hexdigest()
-        report_path = self.save_dir.parent / 'exposure_report.jsonl'
+        report_path = self.save_dir.parent / "exposure_report.jsonl"
         encoded = json.dumps(
             payload,
             allow_nan=False,
-            separators=(',', ':'),
+            separators=(",", ":"),
             sort_keys=True,
         )
         if report_path.is_file():
             lines = [
-                line for line in report_path.read_text(encoding='utf-8').splitlines()
+                line
+                for line in report_path.read_text(encoding="utf-8").splitlines()
                 if line
             ]
             if lines:
                 previous = json.loads(lines[-1])
-                previous_epoch = previous.get('epoch')
-                if previous_epoch == payload['epoch']:
+                previous_epoch = previous.get("epoch")
+                if previous_epoch == payload["epoch"]:
                     if previous != payload:
                         raise ValueError(
-                            'existing sampler exposure epoch differs from runtime'
+                            "existing sampler exposure epoch differs from runtime"
                         )
                     return
-                if isinstance(previous_epoch, int) and previous_epoch > payload['epoch']:
-                    raise ValueError('sampler exposure report epoch moved backwards')
-        with report_path.open('a', encoding='utf-8') as handle:
-            handle.write(encoded + '\n')
+                if (
+                    isinstance(previous_epoch, int)
+                    and previous_epoch > payload["epoch"]
+                ):
+                    raise ValueError("sampler exposure report epoch moved backwards")
+        with report_path.open("a", encoding="utf-8") as handle:
+            handle.write(encoded + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -1626,14 +2030,23 @@ class Trainer:
         self._write_completed_epoch_exposure()
 
     @torch.no_grad()
-    def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
+    def _add_noise(
+        self,
+        latent,
+        train_scheduler,
+        action_mask=False,
+        action_mode=False,
+        noisy_cond_prob=0.0,
+    ):
         B, C, F, H, W = latent.shape
 
-        timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
+        timestep_ids = sample_timestep_id(
+            batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps
+        )
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
-        noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
-        targets =train_scheduler.training_target(latent, noise, timesteps)
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
 
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
@@ -1646,19 +2059,23 @@ class Trainer:
             t=1 if action_mode else 0,  # 1 for action mode (0 for latent), not used
             f_w=1,
             f_shift=0,
-            action=action_mode
-        ).to(self.device)  # shape: [4, seq_len]
+            action=action_mode,
+        ).to(
+            self.device
+        )  # shape: [4, seq_len]
         latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
 
         if torch.rand(1).item() < noisy_cond_prob:
             cond_timestep_ids = sample_timestep_id(
-                    batch_size=F,
-                    min_timestep_bd=0.5,
-                    max_timestep_bd=1.0,
-                    num_train_timesteps=train_scheduler.num_train_timesteps,
-                )
+                batch_size=F,
+                min_timestep_bd=0.5,
+                max_timestep_bd=1.0,
+                num_train_timesteps=train_scheduler.num_train_timesteps,
+            )
             noise = torch.zeros_like(latent).normal_()
-            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=self.device)
+            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(
+                device=self.device
+            )
             latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=2)
         else:
             cond_timesteps = torch.zeros_like(timesteps)
@@ -1688,25 +2105,50 @@ class Trainer:
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
         latent_dict = self._add_noise(
-            latent=batch_dict['latents'],
+            latent=batch_dict["latents"],
             train_scheduler=self.train_scheduler_latent,
             action_mask=None,
             action_mode=False,
-            noisy_cond_prob=0.5)
+            noisy_cond_prob=0.5,
+        )
 
         action_dict = self._add_noise(
-            latent=batch_dict['actions'],
+            latent=batch_dict["actions"],
             train_scheduler=self.train_scheduler_action,
-            action_mask=batch_dict['actions_mask'],
+            action_mask=batch_dict["actions_mask"],
             action_mode=True,
-            noisy_cond_prob=0.0)
-
-        latent_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['actions_mask'] = batch_dict['actions_mask']
-        action_dict['tactile_mode'] = str(
-            getattr(self.config, 'tactile_mode', 'enabled')
+            noisy_cond_prob=0.0,
         )
+
+        latent_dict["text_emb"] = batch_dict["text_emb"]
+        action_dict["text_emb"] = batch_dict["text_emb"]
+        action_dict["actions_mask"] = batch_dict["actions_mask"]
+        action_dict["tactile_mode"] = str(
+            getattr(self.config, "tactile_mode", "enabled")
+        )
+        canonical_contact = bool(
+            getattr(self, "_uses_canonical_contact_contract", False)
+        )
+        if canonical_contact:
+            for key in (
+                "action_valid_mask",
+                "temporal_valid_mask",
+                "tactile_available_mask",
+                "wrench_available_mask",
+                "contact_cond_drop",
+                "tactile_condition_mask",
+                "wrench_condition_mask",
+                "tactile_target_mask",
+            ):
+                action_dict[key] = batch_dict[key]
+            if "wrench" in batch_dict:
+                action_dict["wrench"] = batch_dict["wrench"]
+        else:
+            tactile_cond_drop = getattr(self, "_tactile_cond_drop", False)
+            action_dict["tactile_cond_drop"] = torch.tensor(
+                tactile_cond_drop, dtype=torch.bool, device=self.device
+            )
+
         # Tactile inputs (shared CFG-drop mechanism):
         #   - tactile_cond_drop is explicit CFG dropout; when set, no tactile
         #     tensors are passed to the model so tactile modules get no grad
@@ -1717,63 +2159,113 @@ class Trainer:
         # on self, so device movement there and the target/forward path here use
         # the SAME flag — no independent re-draw that could disagree (the old
         # double-decision built a target from a CPU latent -> device crash).
-        tactile_cond_drop = getattr(self, '_tactile_cond_drop', False)
-        action_dict['tactile_cond_drop'] = torch.tensor(
-            tactile_cond_drop, dtype=torch.bool, device=self.device)
+        tactile_cond_drop = (
+            False if canonical_contact else getattr(self, "_tactile_cond_drop", False)
+        )
         if not tactile_cond_drop:
-            for key in ('tactile_local_latent', 'tactile_sensor_ids'):
-                if key in batch_dict:
-                    action_dict[key] = batch_dict[key]
+            if "tactile_sensor_ids" in batch_dict:
+                action_dict["tactile_sensor_ids"] = batch_dict["tactile_sensor_ids"]
+            if "tactile_local_latent" in batch_dict:
+                local_tactile = batch_dict["tactile_local_latent"]
+                if canonical_contact:
+                    local_condition = batch_dict["tactile_condition_mask"].transpose(
+                        1, 2
+                    )[:, :, None, :, None, None]
+                    local_tactile = local_tactile * local_condition
+                action_dict["tactile_local_latent"] = local_tactile
             # symdiff: noise the GlobalTactile latent so the dedicated
             # tactile_proj_out head can predict the velocity. Treat each sensor as
             # an independent diffusion sample by folding S into the batch dim.
             # GlobalTactile is a diffusion target here, not a clean condition, so
             # the raw tactile_global_latent is consumed via the noised tensors below.
-            if 'tactile_global_latent' in batch_dict:
-                g = batch_dict['tactile_global_latent']                # (B, S, C, F, H, W)
-                if getattr(self.config, 'tactile_global_zero', False):
+            if "tactile_global_latent" in batch_dict:
+                g = batch_dict["tactile_global_latent"]  # (B, S, C, F, H, W)
+                if getattr(self.config, "tactile_global_zero", False):
                     # global-ablation: zero the GlobalTactile latent so the noisy
                     # segment (= pure noise) and clean condition carry no contact
                     # info; sequence/loss structure stays identical to full model.
-                    if not getattr(self, '_tgz_logged', False):
+                    if not getattr(self, "_tgz_logged", False):
                         self._tgz_logged = True
                         logger.info(
                             "tactile_global_zero ACTIVE: zeroing global latent "
-                            "(incoming max=%.4f)", g.abs().max().item())
+                            "(incoming max=%.4f)",
+                            g.abs().max().item(),
+                        )
                     g = torch.zeros_like(g)
                 B, S, C, F, H, W = g.shape
+                target_mask = None
+                condition_mask = None
+                if canonical_contact:
+                    target_mask = batch_dict["tactile_target_mask"].transpose(1, 2)[
+                        :, :, None, :, None, None
+                    ]
+                    condition_mask = batch_dict["tactile_condition_mask"].transpose(
+                        1, 2
+                    )[:, :, None, :, None, None]
+                    g = g * target_mask
                 g_flat = g.reshape(B * S, C, F, H, W).contiguous()
                 tdict = self._add_noise(
                     latent=g_flat,
                     train_scheduler=self.train_scheduler_tactile,
                     action_mask=None,
                     action_mode=False,
-                    noisy_cond_prob=getattr(self.config, 'noisy_cond_prob_tactile', 0.5),
+                    noisy_cond_prob=getattr(
+                        self.config, "noisy_cond_prob_tactile", 0.5
+                    ),
                 )
-                action_dict['tactile_global_noisy_latent'] = (
-                    tdict['noisy_latents'].reshape(B, S, C, F, H, W))
-                action_dict['tactile_global_clean_latent'] = (
-                    tdict['latent'].reshape(B, S, C, F, H, W))
-                action_dict['tactile_global_targets'] = (
-                    tdict['targets'].reshape(B, S, C, F, H, W))
+                noisy_tactile = tdict["noisy_latents"].reshape(B, S, C, F, H, W)
+                clean_tactile = tdict["latent"].reshape(B, S, C, F, H, W)
+                tactile_targets = tdict["targets"].reshape(B, S, C, F, H, W)
+                if canonical_contact:
+                    noisy_tactile = noisy_tactile * target_mask
+                    clean_tactile = clean_tactile * condition_mask
+                    tactile_targets = tactile_targets * target_mask
+                action_dict["tactile_global_noisy_latent"] = noisy_tactile
+                action_dict["tactile_global_clean_latent"] = clean_tactile
+                action_dict["tactile_global_targets"] = tactile_targets
                 # timesteps from _add_noise are (B*S, F); collapse the S dim by
                 # taking the first sensor's schedule (per-frame timestep is shared).
-                action_dict['tactile_global_timesteps'] = (
-                    tdict['timesteps'].reshape(B, S, F)[:, 0])         # (B, F)
-                action_dict['tactile_global_cond_timesteps'] = (
-                    tdict['cond_timesteps'].reshape(B, S, F)[:, 0])    # (B, F)
+                action_dict["tactile_global_timesteps"] = tdict["timesteps"].reshape(
+                    B, S, F
+                )[
+                    :, 0
+                ]  # (B, F)
+                action_dict["tactile_global_cond_timesteps"] = tdict[
+                    "cond_timesteps"
+                ].reshape(B, S, F)[
+                    :, 0
+                ]  # (B, F)
 
         chunk_size, window_size = self._sample_attention_mask_schedule()
         input_dict = {
-            'latent_dict': latent_dict,
-            'action_dict': action_dict,
-            'chunk_size': chunk_size,
-            'window_size': window_size,
+            "latent_dict": latent_dict,
+            "action_dict": action_dict,
+            "chunk_size": chunk_size,
+            "window_size": window_size,
         }
         return input_dict
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
+        if str(getattr(self.config, "dataset_adapter", "")) == (
+            "worldarena_agilex_qpos14"
+        ):
+            converted = _adapt_agilex_training_batch(
+                input_dict,
+                profile=str(getattr(self.config, "tactile_profile", "")),
+                action_dim=int(getattr(self.config, "action_dim", 14)),
+                wrench_arm_count=int(getattr(self.config, "wrench_arm_count", 2)),
+                contact_drop_strategy=str(
+                    getattr(self.config, "contact_cond_drop_strategy", "")
+                ),
+            )
+            self._uses_canonical_contact_contract = True
+            return {
+                key: value.to(self.device) if torch.is_tensor(value) else value
+                for key, value in converted.items()
+            }
+
+        self._uses_canonical_contact_contract = False
         # Decide the tactile CFG-drop ONCE here, BEFORE moving tensors, and stash
         # it on self so _prepare_input_dict reuses the SAME flag. Otherwise the
         # drop used HERE (for device movement) and one re-drawn in _prepare can
@@ -1782,47 +2274,50 @@ class Trainer:
         # mse_loss device-mismatch crash. Batch-level (one flag/batch); shape
         # bucketing keeps tactile presence uniform within a batch, so one draw is
         # correct and avoids per-sample OR-ing that over-drops at batch>1.
-        _has_tactile = (('tactile_global_latent' in input_dict)
-                        or ('tactile_local_latent' in input_dict))
+        _has_tactile = ("tactile_global_latent" in input_dict) or (
+            "tactile_local_latent" in input_dict
+        )
         if not _has_tactile:
             tactile_cond_drop = True
         else:
-            _cfg_p = float(getattr(self.config, 'tactile_cfg_prob', 0.1))
+            _cfg_p = float(getattr(self.config, "tactile_cfg_prob", 0.1))
             tactile_cond_drop = bool(torch.rand(1).item() < _cfg_p)
         self._tactile_cond_drop = tactile_cond_drop
         for key, value in input_dict.items():
             if tactile_cond_drop and key in (
-                'tactile_global_latent',
-                'tactile_local_latent',
+                "tactile_global_latent",
+                "tactile_local_latent",
             ):
                 continue
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
+            input_dict[key] = value.to(self.device)  # .to(self.dtype)
         return input_dict
 
     def _compute_latent_loss(self, input_dict, latent_pred):
-        latent_target = input_dict['latent_dict']['targets']
+        latent_target = input_dict["latent_dict"]["targets"]
         # Transformer video output is a patch sequence:
         #   latent_pred_seq: [B, N_video_tokens, C_patch]
         # Convert it back to dense FlowMatch target layout:
         #   latent_pred/latent_target: [B, C_latent, F_video, H_latent, W_latent]
         latent_pred = data_seq_to_patch(
-            self.patch_size, latent_pred,
+            self.patch_size,
+            latent_pred,
             latent_target.shape[-3],
             latent_target.shape[-2],
             latent_target.shape[-1],
-            batch_size=latent_pred.shape[0])
+            batch_size=latent_pred.shape[0],
+        )
         # timesteps: [B, F_video], one sampled diffusion/flow timestep per frame.
-        Bn, Fn = input_dict['latent_dict']['timesteps'].shape
+        Bn, Fn = input_dict["latent_dict"]["timesteps"].shape
         # latent_loss_weight: [B, F_video], broadcast over C/H/W below.
         latent_loss_weight = self.train_scheduler_latent.training_weight(
-            input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+            input_dict["latent_dict"]["timesteps"].flatten()
+        ).reshape(Bn, Fn)
 
         # Per-element MSE:
         #   latent_loss: [B, C_latent, F_video, H_latent, W_latent]
         latent_loss = F.mse_loss(
-            latent_pred.float(),
-            latent_target.float().detach(),
-            reduction='none')
+            latent_pred.float(), latent_target.float().detach(), reduction="none"
+        )
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
         # Move frame next to batch and flatten all non-frame dimensions:
         #   [B, C, F, H, W] -> [B, F, H, W, C] -> [B*F, H*W*C]
@@ -1834,28 +2329,27 @@ class Trainer:
         return (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
 
     def _compute_action_loss(self, input_dict, action_pred):
-        action_target = input_dict['action_dict']['targets']
-        action_mask = input_dict['action_dict']['actions_mask'].float()
+        action_target = input_dict["action_dict"]["targets"]
+        action_mask = input_dict["action_dict"]["actions_mask"].float()
         # Transformer action output is a token sequence:
         #   action_pred_seq: [B, F_action * N_action, C_action]
         # Dense action target/mask layout is:
         #   action_target/action_mask: [B, C_action, F_action, N_action, 1]
         action_pred = rearrange(
-            action_pred,
-            'b (f n) c -> b c f n 1',
-            f=action_target.shape[-3])
+            action_pred, "b (f n) c -> b c f n 1", f=action_target.shape[-3]
+        )
         # timesteps: [B, F_action], one sampled diffusion/flow timestep per frame.
-        Bn, Fn = input_dict['action_dict']['timesteps'].shape
+        Bn, Fn = input_dict["action_dict"]["timesteps"].shape
         # action_loss_weight: [B, F_action], broadcast over C/N below.
         action_loss_weight = self.train_scheduler_action.training_weight(
-            input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+            input_dict["action_dict"]["timesteps"].flatten()
+        ).reshape(Bn, Fn)
 
         # Per-element MSE:
         #   action_loss: [B, C_action, F_action, N_action, 1]
         action_loss = F.mse_loss(
-            action_pred.float(),
-            action_target.float().detach(),
-            reduction='none')
+            action_pred.float(), action_target.float().detach(), reduction="none"
+        )
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
         action_loss = action_loss * action_mask
         # Move frame next to batch and flatten action channels/horizon:
@@ -1871,12 +2365,11 @@ class Trainer:
         valid_frame = action_mask_per_frame > 0
         if not valid_frame.any():
             return action_loss_per_frame.sum() * 0.0
-        return (action_loss_per_frame[valid_frame] / action_mask_per_frame[valid_frame]).mean()
+        return (
+            action_loss_per_frame[valid_frame] / action_mask_per_frame[valid_frame]
+        ).mean()
 
-    def compute_loss(self,
-        input_dict,
-        pred
-    ):
+    def compute_loss(self, input_dict, pred):
         # Symdiff: pred is 3-tuple (video_pred, action_pred, tactile_pred).
         # Legacy (video+action): pred is 2-tuple (video_pred, action_pred). Handle both.
         #   latent_pred: [B, N_video_tokens, C_patch]
@@ -1899,8 +2392,8 @@ class Trainer:
         zero = torch.zeros((), device=device, dtype=torch.float32)
         tactile_loss = zero
         if tactile_pred is not None:
-            if 'tactile_global_targets' in input_dict['action_dict']:
-                target = input_dict['action_dict']['tactile_global_targets']
+            if "tactile_global_targets" in input_dict["action_dict"]:
+                target = input_dict["action_dict"]["tactile_global_targets"]
                 # target: dense (B, S, C, F, H, W). tactile_pred is a patch
                 # sequence (B, S*F*H*W, C) in (sensor, [f hp wp], [pf ph pw]) patch
                 # order — the SAME convention as the video latent prediction. So,
@@ -1913,28 +2406,53 @@ class Trainer:
                 pred_dense = data_seq_to_patch(
                     self.patch_size,
                     tactile_pred.reshape(B * S, F_lat * H_lat * W_lat, C),
-                    F_lat, H_lat, W_lat,
+                    F_lat,
+                    H_lat,
+                    W_lat,
                     batch_size=B * S,
                 ).reshape(B, S, C, F_lat, H_lat, W_lat)
                 # Keep MSE in pred.dtype (bf16) so tactile_proj_out's grad dtype
                 # stays uniform under FSDP, then promote the scalar to fp32.
-                tactile_loss = torch.nn.functional.mse_loss(
-                    pred_dense, target.to(pred_dense.dtype)).float()
+                per_element_tactile_loss = torch.nn.functional.mse_loss(
+                    pred_dense,
+                    target.to(pred_dense.dtype),
+                    reduction="none",
+                )
+                target_mask = input_dict["action_dict"].get("tactile_target_mask")
+                if target_mask is None:
+                    tactile_loss = per_element_tactile_loss.mean().float()
+                else:
+                    if target_mask.dtype is not torch.bool or tuple(
+                        target_mask.shape
+                    ) != (B, F_lat, S):
+                        raise ValueError(
+                            "tactile_target_mask must have bool shape [B,F,S]"
+                        )
+                    dense_mask = target_mask.transpose(1, 2)[:, :, None, :, None, None]
+                    valid_targets = dense_mask.sum()
+                    if not bool(valid_targets.item()):
+                        tactile_loss = (tactile_pred.sum() * 0.0).float()
+                    else:
+                        denominator = valid_targets * C * H_lat * W_lat
+                        tactile_loss = (
+                            (per_element_tactile_loss * dense_mask).sum()
+                            / denominator.to(per_element_tactile_loss.dtype)
+                        ).float()
             else:
                 # CFG-drop / no-target step: keep tactile_proj_out in autograd
                 # graph with zero contribution so FSDP grad dtype stays uniform.
                 tactile_loss = (tactile_pred.sum() * 0.0).float()
 
-        weight = float(getattr(self.config, 'tactile_diffusion_loss_weight', 1.0))
+        weight = float(getattr(self.config, "tactile_diffusion_loss_weight", 1.0))
         total_loss = latent_loss + action_loss + weight * tactile_loss
         # Divide before backward so accumulated micro-batches produce the same
         # gradient scale as a single large batch.
         scale = self.gradient_accumulation_steps
         return {
-            'latent_loss': latent_loss / scale,
-            'action_loss': action_loss / scale,
-            'tactile_loss': tactile_loss / scale,
-            'total_loss': total_loss / scale,
+            "latent_loss": latent_loss / scale,
+            "action_loss": action_loss / scale,
+            "tactile_loss": tactile_loss / scale,
+            "total_loss": total_loss / scale,
         }
 
     def _train_step(self, batch, batch_idx):
@@ -1954,7 +2472,7 @@ class Trainer:
         output = self.transformer(input_dict, train_mode=True)
         loss_dict = self.compute_loss(input_dict, output)
         # total_loss is already divided by gradient_accumulation_steps.
-        loss_dict['total_loss'].backward()
+        loss_dict["total_loss"].backward()
 
         losses = {
             key: value.detach() if torch.is_tensor(value) else value
@@ -1963,15 +2481,17 @@ class Trainer:
 
         # Only update weights after accumulating gradients
         if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.transformer.parameters(), 2.0
+            )
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
 
-            losses['total_norm'] = total_norm
-            losses['should_log'] = True
+            losses["total_norm"] = total_norm
+            losses["should_log"] = True
         else:
-            losses['should_log'] = False
+            losses["should_log"] = False
 
         return losses
 
@@ -1983,7 +2503,12 @@ class Trainer:
         re-seeded identically every call via fork_rng, so successive val losses
         are comparable rather than dominated by diffusion-timestep noise.
         """
-        metrics = {'latent_loss': [], 'action_loss': [], 'tactile_loss': [], 'total_loss': []}
+        metrics = {
+            "latent_loss": [],
+            "action_loss": [],
+            "tactile_loss": [],
+            "total_loss": [],
+        }
         with torch.random.fork_rng(devices=[self.device]):
             for batch_index, batch in enumerate(self.val_loader):
                 sample_seed = self.val_sample_seeds[batch_index]
@@ -1999,13 +2524,12 @@ class Trainer:
                     if name in loss_dict:
                         # undo the grad-accum division for honest per-sample loss
                         metrics[name].append(
-                            loss_dict[name].detach() * self.gradient_accumulation_steps)
+                            loss_dict[name].detach() * self.gradient_accumulation_steps
+                        )
         out = {}
         for name, vals in metrics.items():
             local_sum = (
-                torch.stack(vals).sum()
-                if vals
-                else torch.zeros((), device=self.device)
+                torch.stack(vals).sum() if vals else torch.zeros((), device=self.device)
             )
             local_count = torch.tensor(
                 float(len(vals)), device=self.device, dtype=torch.float32
@@ -2023,7 +2547,8 @@ class Trainer:
         """Propagate a rank-local checkpoint error to every distributed rank."""
         failed = torch.tensor(
             [0 if error is None else 1],
-            device=self.device if torch.cuda.is_available() else 'cpu')
+            device=self.device if torch.cuda.is_available() else "cpu",
+        )
         if dist.is_initialized():
             dist.all_reduce(failed, op=dist.ReduceOp.MAX)
         if int(failed.item()):
@@ -2047,16 +2572,14 @@ class Trainer:
         runtime_signature = capture_runtime_signature()
         validate_runtime_signature(runtime_signature)
         current_execution_contract = build_training_execution_contract(
-            max_latent_frames=int(getattr(self.config, 'max_latent_frames', 0)),
-            gradient_accumulation_steps=int(
-                self.gradient_accumulation_steps),
-            batch_size=int(getattr(self.config, 'batch_size', 1)),
-            load_worker=int(getattr(self.config, 'load_worker', 0)),
-            num_steps=int(getattr(self.config, 'num_steps', 0)),
-            lr_schedule=str(getattr(
-                self.config, 'lr_schedule', 'constant')),
-            warmup_steps=int(getattr(self.config, 'warmup_steps', 0)),
-            lr_min_ratio=float(getattr(self.config, 'lr_min_ratio', 0.0)),
+            max_latent_frames=int(getattr(self.config, "max_latent_frames", 0)),
+            gradient_accumulation_steps=int(self.gradient_accumulation_steps),
+            batch_size=int(getattr(self.config, "batch_size", 1)),
+            load_worker=int(getattr(self.config, "load_worker", 0)),
+            num_steps=int(getattr(self.config, "num_steps", 0)),
+            lr_schedule=str(getattr(self.config, "lr_schedule", "constant")),
+            warmup_steps=int(getattr(self.config, "warmup_steps", 0)),
+            lr_min_ratio=float(getattr(self.config, "lr_min_ratio", 0.0)),
             activation_checkpointing=_activation_checkpointing_enabled(),
             attention_contract=capture_attention_execution_contract(),
         )
@@ -2068,9 +2591,9 @@ class Trainer:
         latent_inventory_identity: dict[str, str] = {}
         checkpoint_provenance: dict[str, object] = {}
         track32_artifact_identity = getattr(
-            self.config, 'track32_artifact_identity', None
+            self.config, "track32_artifact_identity", None
         )
-        if getattr(self.config, 'track32_profile_id', None) is not None:
+        if getattr(self.config, "track32_profile_id", None) is not None:
             if not isinstance(track32_artifact_identity, dict):
                 raise ValueError(
                     "Track 3.2 checkpoint requires a bound artifact identity"
@@ -2091,9 +2614,7 @@ class Trainer:
                 raise ValueError(
                     "training profile latent inventory identity changed before save"
                 )
-        if (
-            self.runtime_source_identity is None
-        ) != (
+        if (self.runtime_source_identity is None) != (
             self.checkpoint_invocation_identity is None
         ):
             raise ValueError("checkpoint runtime provenance is incomplete")
@@ -2120,14 +2641,14 @@ class Trainer:
                 if final_checkpoint_dir.exists() or checkpoint_dir.exists():
                     raise FileExistsError(
                         "refusing to overwrite an existing final or staging "
-                        f"checkpoint: {final_checkpoint_dir}, {checkpoint_dir}")
+                        f"checkpoint: {final_checkpoint_dir}, {checkpoint_dir}"
+                    )
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 transformer_dir = checkpoint_dir / "transformer"
                 transformer_dir.mkdir(parents=True, exist_ok=True)
                 logger.info(f"Saving transformer to {transformer_dir}")
                 state_dict_bf16 = {
-                    key: value.to(torch.bfloat16)
-                    for key, value in state_dict.items()
+                    key: value.to(torch.bfloat16) for key, value in state_dict.items()
                 }
                 save_file(
                     state_dict_bf16,
@@ -2135,7 +2656,7 @@ class Trainer:
                 )
                 if self.track31_tactile_contract is None:
                     config_dict = dict(self.transformer.config)
-                    config_dict.pop('_name_or_path', None)
+                    config_dict.pop("_name_or_path", None)
                 else:
                     config_dict = _build_track31_transformer_checkpoint_config(
                         self.transformer,
@@ -2143,86 +2664,96 @@ class Trainer:
                         action_schema=self.action_codec.spec.name,
                         action_dim=self.action_codec.spec.dim,
                     )
-                config_dict["tactile_profile"] = (
-                    self.tactile_profile_contract.profile
-                )
+                config_dict["tactile_profile"] = self.tactile_profile_contract.profile
                 config_dict["tactile_profile_contract_sha256"] = (
                     self.tactile_profile_contract.contract_sha256
                 )
                 write_json_atomic(transformer_dir / "config.json", config_dict)
                 transformer_identity = audit_transformer_checkpoint(
                     transformer_dir / TRANSFORMER_WEIGHTS_FILENAME,
-                    expected_action_dim=int(getattr(self.config, 'action_dim', 0)),
+                    expected_action_dim=int(getattr(self.config, "action_dim", 0)),
                 )
 
                 config = self.config
                 meta = {
-                    'step': self.step,
-                    'norm_stat': {
+                    "step": self.step,
+                    "norm_stat": {
                         key: list(value)
                         for key, value in dict(config.norm_stat).items()
                         if isinstance(value, (list, tuple))
                     },
-                    'norm_stat_path': getattr(config, 'norm_stat_path', None),
-                    'action_norm_method': getattr(
-                        config, 'action_norm_method', None),
-                    'action_delta_mode': getattr(
-                        config, 'action_delta_mode', None),
-                    'action_schema': getattr(config, 'action_schema', None),
-                    'action_spec': self.action_codec.spec.to_json_dict(),
-                    'action_dim': int(getattr(config, 'action_dim', 0)),
-                    'pi05_action_horizon': int(getattr(
-                        config, 'pi05_action_horizon', 0)),
-                    'action_per_frame': int(getattr(
-                        config, 'action_per_frame', 0)),
-                    'used_action_channel_ids': [
-                        int(value) for value in getattr(
-                            config, 'used_action_channel_ids', [])
+                    "norm_stat_path": getattr(config, "norm_stat_path", None),
+                    "action_norm_method": getattr(config, "action_norm_method", None),
+                    "action_delta_mode": getattr(config, "action_delta_mode", None),
+                    "action_schema": getattr(config, "action_schema", None),
+                    "action_spec": self.action_codec.spec.to_json_dict(),
+                    "action_dim": int(getattr(config, "action_dim", 0)),
+                    "pi05_action_horizon": int(
+                        getattr(config, "pi05_action_horizon", 0)
+                    ),
+                    "action_per_frame": int(getattr(config, "action_per_frame", 0)),
+                    "used_action_channel_ids": [
+                        int(value)
+                        for value in getattr(config, "used_action_channel_ids", [])
                     ],
-                    'use_local_tactile': bool(getattr(
-                        config, 'use_local_tactile', False)),
-                    'local_tactile_mode': getattr(
-                        config, 'local_tactile_mode', None),
-                    'tactile_global_zero': bool(getattr(
-                        config, 'tactile_global_zero', False)),
-                    'obs_cam_keys': list(getattr(config, 'obs_cam_keys', [])),
-                    'tactile_keys': list(getattr(config, 'tactile_keys', [])),
-                    'eval_prompt': getattr(config, 'eval_prompt', None),
-                    'training_execution_contract': training_execution_contract,
-                    'training_profile_id': getattr(
-                        config, 'training_profile_id', None),
-                    'track32_profile_id': getattr(
-                        config, 'track32_profile_id', None),
-                    'track32_artifact_identity': track32_artifact_identity,
-                    'run_role': getattr(config, 'run_role', None),
-                    'accelerator_profile': getattr(
-                        config, 'accelerator_profile', None),
-                    'train_view_id': getattr(config, 'train_view_id', None),
-                    'validation_view_id': getattr(
-                        config, 'validation_view_id', None),
-                    'training_profile_identity': training_profile_identity,
-                    'training_lineage': self.training_lineage,
-                    'tactile_mode': getattr(config, 'tactile_mode', 'enabled'),
-                    'tactile_profile': self.tactile_profile_contract.profile,
-                    'tactile_profile_contract': (
+                    "use_local_tactile": bool(
+                        getattr(config, "use_local_tactile", False)
+                    ),
+                    "local_tactile_mode": getattr(config, "local_tactile_mode", None),
+                    "tactile_global_zero": bool(
+                        getattr(config, "tactile_global_zero", False)
+                    ),
+                    "obs_cam_keys": list(getattr(config, "obs_cam_keys", [])),
+                    "tactile_keys": list(getattr(config, "tactile_keys", [])),
+                    "eval_prompt": getattr(config, "eval_prompt", None),
+                    "training_execution_contract": training_execution_contract,
+                    "training_profile_id": getattr(config, "training_profile_id", None),
+                    "track32_profile_id": getattr(config, "track32_profile_id", None),
+                    "track32_artifact_identity": track32_artifact_identity,
+                    "run_role": getattr(config, "run_role", None),
+                    "accelerator_profile": getattr(config, "accelerator_profile", None),
+                    "fsdp_topology": runtime_signature["fsdp_execution_contract"][
+                        "topology"
+                    ],
+                    "fsdp_shard_size": runtime_signature["fsdp_execution_contract"][
+                        "shard_size"
+                    ],
+                    "fsdp_replicate_size": runtime_signature["fsdp_execution_contract"][
+                        "replicate_size"
+                    ],
+                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+                    "nccl_net_gdr_level": os.environ.get("NCCL_NET_GDR_LEVEL"),
+                    "nccl_dmabuf_enable": os.environ.get("NCCL_DMABUF_ENABLE"),
+                    "nccl_net_plugin": os.environ.get("NCCL_NET_PLUGIN"),
+                    "rccl_plugin_sha256": os.environ.get(
+                        "N0_TRACK32_RCCL_PLUGIN_SHA256"
+                    ),
+                    "train_view_id": getattr(config, "train_view_id", None),
+                    "validation_view_id": getattr(config, "validation_view_id", None),
+                    "training_profile_identity": training_profile_identity,
+                    "training_lineage": self.training_lineage,
+                    "tactile_mode": getattr(config, "tactile_mode", "enabled"),
+                    "tactile_profile": self.tactile_profile_contract.profile,
+                    "tactile_profile_contract": (
                         self.tactile_profile_contract.to_json_dict()
                     ),
-                    'source_action_schema': getattr(
-                        config, 'source_action_schema', None),
-                    'derived_action_schema': getattr(
-                        config, 'derived_action_schema', None),
-                    'trainability_contract': (
+                    "source_action_schema": getattr(
+                        config, "source_action_schema", None
+                    ),
+                    "derived_action_schema": getattr(
+                        config, "derived_action_schema", None
+                    ),
+                    "trainability_contract": (
                         self.trainability_contract.to_json_dict()
                     ),
-                    'initialization_mode': getattr(
-                        config, 'initialization_mode', None),
-                    'transformer_identity': transformer_identity,
-                    'sampler_state': (
+                    "initialization_mode": getattr(config, "initialization_mode", None),
+                    "transformer_identity": transformer_identity,
+                    "sampler_state": (
                         self.train_sampler.state_dict()
-                        if hasattr(self.train_sampler, 'state_dict')
+                        if hasattr(self.train_sampler, "state_dict")
                         else None
                     ),
-                    'track31_artifacts': (
+                    "track31_artifacts": (
                         None
                         if self.track31_artifacts is None
                         else self.track31_artifacts.to_json_dict()
@@ -2261,8 +2792,7 @@ class Trainer:
             )
             if self.config.rank == 0:
                 if transformer_identity is None:
-                    raise RuntimeError(
-                        "saved transformer identity was not produced")
+                    raise RuntimeError("saved transformer identity was not produced")
                 save_scheduler_state(
                     checkpoint_dir,
                     self.lr_scheduler.state_dict(),
@@ -2271,24 +2801,25 @@ class Trainer:
                     execution_contract=training_execution_contract,
                 )
                 training_state = {
-                    'schema_version': STRICT_CHECKPOINT_SCHEMA_VERSION,
-                    'step': self.step,
-                    'data_batches_consumed': self.data_batches_consumed,
-                    'world_size': int(self.config.world_size),
-                    'gradient_accumulation_steps': int(
-                        self.gradient_accumulation_steps),
-                    'action_schema': self.action_codec.spec.name,
-                    'optimizer_state_format': OPTIMIZER_STATE_FORMAT,
-                    'optimizer_inventory_sha256': (
+                    "schema_version": STRICT_CHECKPOINT_SCHEMA_VERSION,
+                    "step": self.step,
+                    "data_batches_consumed": self.data_batches_consumed,
+                    "world_size": int(self.config.world_size),
+                    "gradient_accumulation_steps": int(
+                        self.gradient_accumulation_steps
+                    ),
+                    "action_schema": self.action_codec.spec.name,
+                    "optimizer_state_format": OPTIMIZER_STATE_FORMAT,
+                    "optimizer_inventory_sha256": (
                         optimizer_inventory.inventory_sha256
                     ),
-                    'runtime_signature': runtime_signature,
-                    'training_execution_contract': training_execution_contract,
-                    'training_profile_identity': training_profile_identity,
-                    'training_lineage': self.training_lineage,
-                    'transformer_identity': transformer_identity,
-                    'track32_artifact_identity': track32_artifact_identity,
-                    'tactile_profile_contract': (
+                    "runtime_signature": runtime_signature,
+                    "training_execution_contract": training_execution_contract,
+                    "training_profile_identity": training_profile_identity,
+                    "training_lineage": self.training_lineage,
+                    "transformer_identity": transformer_identity,
+                    "track32_artifact_identity": track32_artifact_identity,
+                    "tactile_profile_contract": (
                         self.tactile_profile_contract.to_json_dict()
                     ),
                     **latent_inventory_identity,
@@ -2315,38 +2846,35 @@ class Trainer:
         try:
             if self.config.rank == 0:
                 if transformer_identity is None:
-                    raise RuntimeError(
-                        "saved transformer identity was not produced")
+                    raise RuntimeError("saved transformer identity was not produced")
                 sidecar_paths = expected_sidecar_paths(
                     int(self.config.world_size),
                     include_transformer_config=True,
-                    include_action_migration=(
-                        self.action_migration_report is not None
-                    ),
+                    include_action_migration=(self.action_migration_report is not None),
                 )
                 sidecar_inventory = build_sidecar_inventory(
                     checkpoint_dir, sidecar_paths
                 )
                 completion = {
-                    'schema_version': STRICT_CHECKPOINT_SCHEMA_VERSION,
-                    'step': self.step,
-                    'world_size': int(self.config.world_size),
-                    'action_schema': self.action_codec.spec.name,
-                    'optimizer_state_format': OPTIMIZER_STATE_FORMAT,
-                    'optimizer_inventory_sha256': (
+                    "schema_version": STRICT_CHECKPOINT_SCHEMA_VERSION,
+                    "step": self.step,
+                    "world_size": int(self.config.world_size),
+                    "action_schema": self.action_codec.spec.name,
+                    "optimizer_state_format": OPTIMIZER_STATE_FORMAT,
+                    "optimizer_inventory_sha256": (
                         optimizer_inventory.inventory_sha256
                     ),
-                    'runtime_signature': runtime_signature,
-                    'training_execution_contract': training_execution_contract,
-                    'training_profile_identity': training_profile_identity,
-                    'training_lineage': self.training_lineage,
-                    'transformer_identity': transformer_identity,
-                    'track32_artifact_identity': track32_artifact_identity,
-                    'tactile_profile_contract': (
+                    "runtime_signature": runtime_signature,
+                    "training_execution_contract": training_execution_contract,
+                    "training_profile_identity": training_profile_identity,
+                    "training_lineage": self.training_lineage,
+                    "transformer_identity": transformer_identity,
+                    "track32_artifact_identity": track32_artifact_identity,
+                    "tactile_profile_contract": (
                         self.tactile_profile_contract.to_json_dict()
                     ),
-                    'sidecar_inventory': sidecar_inventory,
-                    'status': 'complete',
+                    "sidecar_inventory": sidecar_inventory,
+                    "status": "complete",
                     **latent_inventory_identity,
                     **checkpoint_provenance,
                 }
@@ -2376,25 +2904,27 @@ class Trainer:
         if dist.is_initialized():
             dist.barrier()
         if self.config.rank == 0:
-            logger.info(
-                f"Checkpoint saved successfully at {final_checkpoint_dir}"
-            )
+            logger.info(f"Checkpoint saved successfully at {final_checkpoint_dir}")
 
     def train(self):
         """Main training loop - train by steps instead of epochs."""
         invocation_contract = self._validate_invocation_contract()
         self.invocation_contract = invocation_contract
-        stop_after_step = int(invocation_contract['stop_after_step'])
+        stop_after_step = int(invocation_contract["stop_after_step"])
         # optimizer-steps per epoch (len() covers both the bucketed batch_sampler
         # and the plain DistributedSampler paths) -> show epoch progress alongside
         # the step-based loop.
         try:
             self.steps_per_epoch = max(
-                1, len(self.train_loader) // max(1, self.gradient_accumulation_steps))
+                1, len(self.train_loader) // max(1, self.gradient_accumulation_steps)
+            )
         except Exception:
             self.steps_per_epoch = 0
-        _ep = (f"{self.config.num_steps / self.steps_per_epoch:.2f}"
-               if self.steps_per_epoch else "?")
+        _ep = (
+            f"{self.config.num_steps / self.steps_per_epoch:.2f}"
+            if self.steps_per_epoch
+            else "?"
+        )
         logger.info(
             "Starting training invocation at global optimizer step "
             f"{self.step}; stop_after_step={stop_after_step}, "
@@ -2409,15 +2939,15 @@ class Trainer:
             disable=(self.config.rank != 0),
             leave=True,
             dynamic_ncols=True,
-            initial=self.step
+            initial=self.step,
         )
 
         self.optimizer.zero_grad()
         metric_names = [
-            'latent_loss',
-            'action_loss',
-            'total_loss',
-            'tactile_loss',     # symdiff; always tracked (0 if unused)
+            "latent_loss",
+            "action_loss",
+            "total_loss",
+            "tactile_loss",  # symdiff; always tracked (0 if unused)
         ]
         accumulated_metrics = {name: [] for name in metric_names}
         step_in_accumulation = 0
@@ -2428,11 +2958,16 @@ class Trainer:
 
             try:
                 losses = self._train_step(batch, step_in_accumulation)
-            except Exception as e:
+            except Exception:
                 import traceback
 
                 rank = self.config.rank
-                err_msg = f"\n{'='*60}\n[RANK {rank}] CRASH at step {self.step}, iter {step_in_accumulation}\n{traceback.format_exc()}{'='*60}\n"
+                separator = "=" * 60
+                err_msg = (
+                    f"\n{separator}\n[RANK {rank}] CRASH at step {self.step}, "
+                    f"iter {step_in_accumulation}\n{traceback.format_exc()}"
+                    f"{separator}\n"
+                )
                 logger.error(err_msg)
                 # Keep immutable source snapshots read-only in formal runs. Crash
                 # diagnostics belong to the writable run root, and a secondary
@@ -2458,7 +2993,7 @@ class Trainer:
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
-            if losses['should_log']:
+            if losses["should_log"]:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 present_metrics = [
@@ -2494,32 +3029,52 @@ class Trainer:
                     gc.collect()
 
                 if self.config.rank == 0:
-                    total_norm = losses['total_norm']
+                    total_norm = losses["total_norm"]
                     progress_bar.n += self.gradient_accumulation_steps
                     progress_postfix = {
-                        'latent_loss':  f'{metric_shows.get("latent_loss", 0.0):.4f}',
-                        'action_loss':  f'{metric_shows.get("action_loss", 0.0):.4f}',
-                        'tactile_loss': f'{metric_shows.get("tactile_loss", 0.0):.4f}',
-                        'step': self.step,
-                        'epoch': (f'{self.step / self.steps_per_epoch:.2f}'
-                                  if self.steps_per_epoch else '?'),
-                        'grad_norm': f'{total_norm.item():.2f}',
-                        'lr': f'{lr:.2e}'
+                        "latent_loss": f'{metric_shows.get("latent_loss", 0.0):.4f}',
+                        "action_loss": f'{metric_shows.get("action_loss", 0.0):.4f}',
+                        "tactile_loss": f'{metric_shows.get("tactile_loss", 0.0):.4f}',
+                        "step": self.step,
+                        "epoch": (
+                            f"{self.step / self.steps_per_epoch:.2f}"
+                            if self.steps_per_epoch
+                            else "?"
+                        ),
+                        "grad_norm": f"{total_norm.item():.2f}",
+                        "lr": f"{lr:.2e}",
                     }
                     progress_bar.set_postfix(progress_postfix)
                     if self.config.enable_wandb:
                         wandb_log = {
-                            'loss_metrics/global_avg_video_loss':   metric_shows.get('latent_loss', 0.0),
-                            'loss_metrics/global_avg_action_loss':  metric_shows.get('action_loss', 0.0),
-                            'loss_metrics/global_avg_tactile_loss': metric_shows.get('tactile_loss', 0.0),
-                            'loss_metrics/global_max_video_loss':   max_metric_shows.get('latent_loss', 0.0),
-                            'loss_metrics/global_max_action_loss':  max_metric_shows.get('action_loss', 0.0),
-                            'loss_metrics/global_max_tactile_loss': max_metric_shows.get('tactile_loss', 0.0),
-                            'loss_metrics/global_avg_total_loss':   metric_shows.get('total_loss', 0.0),
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                            'epoch': (self.step / self.steps_per_epoch
-                                      if self.steps_per_epoch else 0),
+                            "loss_metrics/global_avg_video_loss": metric_shows.get(
+                                "latent_loss", 0.0
+                            ),
+                            "loss_metrics/global_avg_action_loss": metric_shows.get(
+                                "action_loss", 0.0
+                            ),
+                            "loss_metrics/global_avg_tactile_loss": metric_shows.get(
+                                "tactile_loss", 0.0
+                            ),
+                            "loss_metrics/global_max_video_loss": max_metric_shows.get(
+                                "latent_loss", 0.0
+                            ),
+                            "loss_metrics/global_max_action_loss": max_metric_shows.get(
+                                "action_loss", 0.0
+                            ),
+                            "loss_metrics/global_max_tactile_loss": max_metric_shows.get(
+                                "tactile_loss", 0.0
+                            ),
+                            "loss_metrics/global_avg_total_loss": metric_shows.get(
+                                "total_loss", 0.0
+                            ),
+                            "grad_norm": total_norm.item(),
+                            "lr": lr,
+                            "epoch": (
+                                self.step / self.steps_per_epoch
+                                if self.steps_per_epoch
+                                else 0
+                            ),
                         }
                         self.wandb.log(wandb_log, step=self.step)
 
@@ -2529,12 +3084,14 @@ class Trainer:
                     val_metrics = self._validate()
                     if self.config.rank == 0:
                         logger.info(
-                            f"[val @ step {self.step}] " + " ".join(
-                                f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                            f"[val @ step {self.step}] "
+                            + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+                        )
                         if self.config.enable_wandb:
-                            self.wandb.log({f'val_metrics/{k}': v
-                                            for k, v in val_metrics.items()},
-                                           step=self.step)
+                            self.wandb.log(
+                                {f"val_metrics/{k}": v for k, v in val_metrics.items()},
+                                step=self.step,
+                            )
 
                 checkpoint_due = (
                     self.step % self.config.save_interval == 0
@@ -2547,9 +3104,7 @@ class Trainer:
 
         progress_bar.close()
         if self.step == self.config.num_steps:
-            logger.info(
-                f"Final training completed at optimizer step {self.step}."
-            )
+            logger.info(f"Final training completed at optimizer step {self.step}.")
         else:
             logger.info(
                 "Training invocation completed at optimizer step "
@@ -2563,10 +3118,10 @@ def run(args):
     config = TWAM_CONFIGS[args.config_name]
 
     rank = int(os.getenv("RANK", 0))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    if hasattr(config, 'seed'):
+    if hasattr(config, "seed"):
         process_seed = _set_reproducibility(config.seed, rank)
     else:
         process_seed = None
@@ -2596,7 +3151,7 @@ def main():
     parser.add_argument(
         "--config-name",
         type=str,
-        default='posttrain',
+        default="posttrain",
         help="Config name",
     )
     parser.add_argument(

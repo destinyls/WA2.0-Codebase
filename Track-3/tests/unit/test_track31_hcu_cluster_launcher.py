@@ -264,6 +264,7 @@ def _environment(tmp_path: Path, *, existing: bool = True) -> dict[str, str]:
         {
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "LC_ALL": "C",
+            "PYTHONHASHSEED": "20260801",
             "MOCK_STATE": str(tmp_path / "state"),
             "MOCK_EXISTING_CONTAINERS": "1" if existing else "0",
             "N0_TRACK31_KNOWN_HOSTS": str(known_hosts),
@@ -932,9 +933,7 @@ def test_hsdp_performance_recipe_is_bound_and_forwarded(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
-    launches = [
-        call for call in calls if call["cmd"][:3] == ["docker", "exec", "-d"]
-    ]
+    launches = [call for call in calls if call["cmd"][:3] == ["docker", "exec", "-d"]]
     manifest_calls = [
         call
         for call in calls
