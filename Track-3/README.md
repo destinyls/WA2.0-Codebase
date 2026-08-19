@@ -626,9 +626,9 @@ n0-twam track32 train \
   | tee "$N0_FRANKA_WORK/franka-development.result.json"
 ```
 
-Use `hcu_performance` only in the validated HCU image and bind its collective
-interface. `final_refit` starts from the released base with all 600 episodes;
-it does not resume the 540-episode development optimizer.
+For six-node Franka HCU training, use the fail-closed workflow in
+[TRACK32_FRANKA_HSDP.md](docs/TRACK32_FRANKA_HSDP.md); it binds the 6x8 HSDP
+mesh, SHCA/RDMA transport and checkpoint receipt. `final_refit` starts from the released base.
 
 Seal a complete checkpoint, create and calibrate the Policy config, generate
 predictions for the frozen validation view, and score them in that order:

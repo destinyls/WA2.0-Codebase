@@ -146,10 +146,9 @@ test set or report it as a leaderboard score.
 
 ## Training requests and accelerator profiles
 
-Create requests with `n0-twam track32 build-request`; it fills every SHA field
-after auditing the inputs. The public runner is request-only and single-node.
-It removes ambient `N0_*`, Python-path, loader-injection, and device-selection
-variables before constructing the child environment.
+`n0-twam track32 build-request` audits every input SHA. The request-only,
+single-node runner removes ambient `N0_*`, Python-path, loader-injection, and
+device-selection variables before constructing the child environment.
 
 Two profiles are supported without code edits:
 
@@ -158,10 +157,9 @@ Two profiles are supported without code edits:
 | `portable` | NVIDIA or standard PyTorch | grouped SDPA, FP32 reduction, activation checkpointing |
 | `hcu_performance` | validated vendor HCU image | vendor grouped Flash Attention, BF16 reduction, expert pre/post reuse, no activation checkpointing |
 
-The HCU profile fails closed when the vendor Flash Attention package is absent.
-It also requires one explicit collective network interface; the runner binds
-both NCCL and Gloo to that interface and rejects names absent from the runtime
-container. Do not select it merely to make a generic GPU command faster.
+The HCU profile fails closed without vendor Flash Attention, binds NCCL and Gloo
+to one explicit interface, and rejects names absent from the container. The
+six-node procedure is in [TRACK32_FRANKA_HSDP.md](TRACK32_FRANKA_HSDP.md).
 
 Example:
 

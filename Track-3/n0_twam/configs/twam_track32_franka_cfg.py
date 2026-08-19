@@ -143,6 +143,18 @@ cfg.run_role = _ROLE
 cfg.accelerator_profile = os.environ.get("N0_TRACK32_ACCELERATOR_PROFILE", "portable")
 if cfg.accelerator_profile not in {"portable", "hcu_performance"}:
     raise ValueError("invalid N0_TRACK32_ACCELERATOR_PROFILE")
+cfg.fsdp_topology = os.environ.get("N0_FSDP_TOPOLOGY", "global_shard")
+if cfg.fsdp_topology not in {"global_shard", "hsdp"}:
+    raise ValueError("N0_FSDP_TOPOLOGY must be global_shard or hsdp")
+cfg.fsdp_shard_size = _positive_int_env(
+    "N0_FSDP_SHARD_SIZE",
+    _positive_int_env("N0_TRACK32_EXPECTED_WORLD_SIZE", 1),
+)
+cfg.nccl_ib_hca = os.environ.get("NCCL_IB_HCA")
+cfg.nccl_net_gdr_level = os.environ.get("NCCL_NET_GDR_LEVEL")
+cfg.nccl_dmabuf_enable = os.environ.get("NCCL_DMABUF_ENABLE")
+cfg.nccl_net_plugin = os.environ.get("NCCL_NET_PLUGIN")
+cfg.rccl_plugin_sha256 = os.environ.get("N0_TRACK32_RCCL_PLUGIN_SHA256")
 cfg.training_profile_id = None
 cfg.track32_profile_id = TRACK32_PROFILE_ID
 cfg.track32_artifact_identity = _artifact_identity_from_environment()

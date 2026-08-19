@@ -2712,6 +2712,22 @@ class Trainer:
                     "track32_artifact_identity": track32_artifact_identity,
                     "run_role": getattr(config, "run_role", None),
                     "accelerator_profile": getattr(config, "accelerator_profile", None),
+                    "fsdp_topology": runtime_signature["fsdp_execution_contract"][
+                        "topology"
+                    ],
+                    "fsdp_shard_size": runtime_signature["fsdp_execution_contract"][
+                        "shard_size"
+                    ],
+                    "fsdp_replicate_size": runtime_signature["fsdp_execution_contract"][
+                        "replicate_size"
+                    ],
+                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+                    "nccl_net_gdr_level": os.environ.get("NCCL_NET_GDR_LEVEL"),
+                    "nccl_dmabuf_enable": os.environ.get("NCCL_DMABUF_ENABLE"),
+                    "nccl_net_plugin": os.environ.get("NCCL_NET_PLUGIN"),
+                    "rccl_plugin_sha256": os.environ.get(
+                        "N0_TRACK32_RCCL_PLUGIN_SHA256"
+                    ),
                     "train_view_id": getattr(config, "train_view_id", None),
                     "validation_view_id": getattr(config, "validation_view_id", None),
                     "training_profile_identity": training_profile_identity,
