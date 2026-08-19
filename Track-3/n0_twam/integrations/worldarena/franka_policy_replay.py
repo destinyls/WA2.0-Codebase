@@ -15,6 +15,11 @@ from typing import Iterator
 import numpy as np
 import numpy.typing as npt
 
+from .franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
+)
 from .franka_manifest import canonical_sha256
 from .franka_policy import FrankaActionBackend, FrankaSafetyConfig, Policy
 from .franka_realtime import (
@@ -23,7 +28,7 @@ from .franka_realtime import (
     summarize_franka_policy_latency,
 )
 
-REPLAY_SCHEMA_VERSION = 2
+REPLAY_SCHEMA_VERSION = 3
 _OBSERVATION_KEYS = frozenset(
     ("cam_high", "cam_left_wrist", "left_end_pose", "joint_qpos")
 )
@@ -291,7 +296,9 @@ def run_franka_policy_replay(
                     or metadata.get("action_format") != "end_pose_base"
                     or metadata.get("action_dim") != 8
                     or metadata.get("chunk_size") != 1
-                    or metadata.get("quaternion_order") != "wxyz"
+                    or metadata.get("quaternion_order") != FRANKA_QUATERNION_ORDER
+                    or metadata.get("wire_action_schema") != FRANKA_ACTION_SCHEMA
+                    or metadata.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
                     or metadata.get("tactile_mode") != "disabled"
                     or type(metadata.get("safety_intervened")) is not bool
                     or type(metadata.get("safety_intervention_count")) is not int
@@ -363,7 +370,9 @@ def run_franka_policy_replay(
         "steps": steps,
         "action_format": "end_pose_base",
         "action_dim": 8,
-        "quaternion_order": "wxyz",
+        "quaternion_order": FRANKA_QUATERNION_ORDER,
+        "wire_action_schema": FRANKA_ACTION_SCHEMA,
+        "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "tactile_mode": "disabled",
         "safety_intervention_count": intervention_count,
         "mean_infer_ms": float(np.mean(infer_times_ms)),

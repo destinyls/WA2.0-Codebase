@@ -11,7 +11,11 @@ from typing import Sequence
 
 import numpy as np
 
-from n0_twam.integrations.worldarena.franka_actions import end_pose8_to_ee10
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    end_pose8_to_ee10,
+)
 from n0_twam.integrations.worldarena.franka_convert import (
     write_franka_lerobot_dataset,
 )
@@ -94,8 +98,8 @@ def _normalizer(
         "schema_version": 1,
         "normalizer_id": f"franka_ee20_{view.view_id}",
         "method": "q01q99",
-        "source_action_schema": "franka_end_pose_base_wxyz8_v1",
-        "derived_action_schema": "franka_ee10_rot6d_columns_v1",
+        "source_action_schema": FRANKA_ACTION_SCHEMA,
+        "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "model_action_schema": "ee20_absee",
         "active_action_channel_ids": list(range(10)),
         "source_records_sha256": source_records_sha256,

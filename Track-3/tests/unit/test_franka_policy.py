@@ -102,7 +102,7 @@ def _config(tmp_path: Path) -> Path:
 
 def _backend_output() -> np.ndarray:
     poses = np.repeat(
-        np.asarray([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5]], np.float32),
+        np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5]], np.float32),
         12,
         axis=0,
     )
@@ -113,7 +113,7 @@ def _backend_output() -> np.ndarray:
 
 def _unsafe_backend_output() -> np.ndarray:
     poses = np.repeat(
-        np.asarray([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5]], np.float32),
+        np.asarray([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5]], np.float32),
         12,
         axis=0,
     )
@@ -129,7 +129,7 @@ def _observation(frame_value: int = 0) -> dict[str, object]:
             "cam_high": np.full((8, 8, 3), frame_value, dtype=np.uint8),
             "cam_left_wrist": np.full((8, 8, 3), frame_value + 1, dtype=np.uint8),
         },
-        "left_end_pose": np.asarray((0, 0, 0, 1, 0, 0, 0), np.float32),
+        "left_end_pose": np.asarray((0, 0, 0, 0, 0, 0, 1), np.float32),
         "joint_qpos": np.asarray((0, 0, 0, 0, 0, 0, 0, 0.5), np.float32),
     }
 
@@ -150,7 +150,13 @@ def test_policy_emits_one_action_and_grounds_cold_chunk(tmp_path: Path) -> None:
     assert result["policy_metadata"]["action_format"] == "end_pose_base"
     assert result["policy_metadata"]["control_arm"] == "right"
     assert result["policy_metadata"]["chunk_size"] == 1
-    assert result["policy_metadata"]["quaternion_order"] == "wxyz"
+    assert result["policy_metadata"]["quaternion_order"] == "xyzw"
+    assert result["policy_metadata"]["wire_action_schema"] == (
+        "franka_end_pose_base_xyzw8_v2"
+    )
+    assert result["policy_metadata"]["derived_action_schema"] == (
+        "franka_ee10_rot6d_columns_from_xyzw_v2"
+    )
     assert result["policy_metadata"]["tactile_mode"] == "disabled"
     assert result["policy_metadata"]["tactile_profile"] == "vision_only"
     assert result["policy_timing"]["kind"] == "cold_generation"

@@ -6,26 +6,35 @@ import numpy as np
 import pytest
 
 from n0_twam.integrations.worldarena.franka_actions import (
+    ACTION_CONTRACT,
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
     ee10_to_end_pose8,
     embed_ee10_in_ee20,
     end_pose8_to_ee10,
     extract_ee10_from_ee20,
-    quaternion_wxyz_to_matrix,
+    quaternion_xyzw_to_matrix,
 )
 
 
 def _golden_poses() -> np.ndarray:
     return np.asarray(
         (
-            (0.31, -0.12, 0.48, 1.0, 0.0, 0.0, 0.0, 0.02),
-            (0.22, 0.08, 0.37, 0.35, -0.2, 0.71, 0.57, 0.06),
-            (-0.10, 0.14, 0.61, 0.5, 0.5, -0.5, 0.5, 0.01),
+            (0.31, -0.12, 0.48, 0.0, 0.0, 0.0, 1.0, 0.02),
+            (0.22, 0.08, 0.37, -0.2, 0.71, 0.57, 0.35, 0.06),
+            (-0.10, 0.14, 0.61, 0.5, -0.5, 0.5, 0.5, 0.01),
         ),
         dtype=np.float32,
     )
 
 
-def test_end_pose8_ee10_round_trip_preserves_pose_and_wxyz_order() -> None:
+def test_franka_action_contract_is_versioned_xyzw() -> None:
+    assert FRANKA_ACTION_SCHEMA == "franka_end_pose_base_xyzw8_v2"
+    assert DERIVED_ACTION_SCHEMA == "franka_ee10_rot6d_columns_from_xyzw_v2"
+    assert ACTION_CONTRACT.quaternion_order == "xyzw"
+
+
+def test_end_pose8_ee10_round_trip_preserves_pose_and_xyzw_order() -> None:
     poses = _golden_poses()
 
     ee10 = end_pose8_to_ee10(poses)
@@ -35,11 +44,27 @@ def test_end_pose8_ee10_round_trip_preserves_pose_and_wxyz_order() -> None:
     np.testing.assert_allclose(decoded[:, :3], poses[:, :3], atol=1e-6)
     np.testing.assert_allclose(decoded[:, 7], poses[:, 7], atol=1e-6)
     np.testing.assert_allclose(
-        quaternion_wxyz_to_matrix(decoded[:, 3:7]),
-        quaternion_wxyz_to_matrix(poses[:, 3:7]),
+        quaternion_xyzw_to_matrix(decoded[:, 3:7]),
+        quaternion_xyzw_to_matrix(poses[:, 3:7]),
         atol=1e-6,
     )
     assert not np.allclose(decoded[1, 3:7], poses[1, [4, 5, 6, 3]])
+
+
+def test_xyzw_z_rotation_maps_to_expected_rot6d_columns() -> None:
+    half_sqrt = np.sqrt(0.5)
+    pose = np.asarray(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, half_sqrt, half_sqrt, 0.5]],
+        dtype=np.float32,
+    )
+
+    ee10 = end_pose8_to_ee10(pose)
+
+    np.testing.assert_allclose(
+        ee10[0, 3:9],
+        np.asarray((0.0, 1.0, 0.0, -1.0, 0.0, 0.0), dtype=np.float32),
+        atol=1e-6,
+    )
 
 
 def test_franka_ee10_embeds_only_in_first_half_of_released_head() -> None:

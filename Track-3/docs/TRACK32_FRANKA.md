@@ -5,16 +5,18 @@ deployment path. It is intentionally separate from the UniVTAC Track 3.1
 pipeline: no UniVTAC split, tactile tensor, ACT target, or qpos8 action codec is
 imported into this workflow.
 
-## Official interface frozen by this branch
+## Verified interface frozen by this branch
 
 The current WorldArena Franka command is `end_pose_base`:
 
 ```text
-[x, y, z, qw, qx, qy, qz, gripper]
+[x, y, z, qx, qy, qz, qw, gripper]
 ```
 
 - position and orientation are expressed in the robot base frame;
-- quaternion order is scalar-first `wxyz`;
+- quaternion order is scalar-last `xyzw`;
+- this branch follows the verified dataset bytes and robot API, correcting the
+  scalar-first order previously printed in the Challenge prose;
 - `joint_qpos=[joint_0..joint_6, gripper]` is an observation, not the action;
 - the Policy returns one `float32[1,8]` command per long-poll call and declares
   `action_format=end_pose_base` plus `control_arm=right`;
@@ -31,7 +33,7 @@ The released N0-TWAM Action Expert remains 20D. Replacing it with an 8D head
 would discard compatible pretrained action weights, so this branch uses:
 
 ```text
-official pose8 (wxyz)
+verified pose8 (xyzw)
     -> EE10 = [xyz, first two rotation-matrix columns, gripper]
     -> EE20[0:10] = EE10
     -> EE20[10:20] = 0, validity mask false
@@ -42,8 +44,15 @@ is not forward kinematics. `joint_qpos` may be used in a future fallback only
 with a frozen URDF, TCP, base frame, calibration identity, and consistency
 audit; it is not used as a training action in this implementation.
 
+The XYZW correction is an incompatible data-contract revision. Converted
+LeRobot repositories, q01/q99 normalizers, checkpoints, prediction artifacts,
+serve bundles, and replay receipts carrying the former WXYZ/v1 identities must
+not be resumed or relabeled. Re-run conversion and normalization from the
+immutable raw release, then start a new post-training lineage from the released
+base checkpoint. Exact schema/profile checks reject the old artifacts.
+
 The Policy re-orthogonalizes predicted rot6d with Gram-Schmidt, converts it to
-`wxyz`, and chooses the quaternion sign closest to the current/previous command.
+`xyzw`, and chooses the quaternion sign closest to the current/previous command.
 
 ## No-tactile contract
 
@@ -227,7 +236,7 @@ the following arrays:
   `cam_high`, `cam_left_wrist`;
 - `video_valid`: `bool[N,2,T]`;
 - `predicted_end_pose` and `target_end_pose`: finite float `[N,A,8]` in the
-  official `end_pose_base=[xyz,wxyz,gripper]` layout;
+  verified `end_pose_base=[xyz,xyzw,gripper]` layout;
 - `action_valid`: `bool[N,A]`;
 - `lerobot_episode_ids`: unique integer `[N]` used to audit the canonical view
   roster;
@@ -238,7 +247,8 @@ the following arrays:
 `pack-predictions` is the supported O_EXCL, atomic public materializer. Its
 metadata JSON contains exactly `checkpoint_identity_sha256`, `dataset_view_id`,
 `dataset_view_sha256`, `decoder_sha256`, `seed`, `run_role`, and
-`prediction_mode`; its array NPZ contains exactly the arrays listed above plus
+`prediction_mode`, `wire_action_schema`, `derived_action_schema`, and
+`quaternion_order`; its array NPZ contains exactly the arrays listed above plus
 the view names, offsets, sample IDs, and task IDs.
 
 The report contains episode-macro PSNR/SSIM, Position MAE/RMSE in centimetres,
@@ -327,39 +337,31 @@ they do not select the outgoing canonical arm ID.
 
 ### Organizer bridge quaternion audit and worker launch
 
-The official wire order is `wxyz`, while the canonical WorldArena packet stores
-quaternion fields as `xyzw`. Both directions must be explicit:
+The verified Franka wire order and the canonical WorldArena packet are both
+`xyzw`. Both directions therefore preserve position without reordering:
 
-- canonical `Quaternion(x,y,z,w)` must become Franka `left_end_pose`
-  `[x,y,z,qw,qx,qy,qz]`;
-- Policy action `[x,y,z,qw,qx,qy,qz,gripper]` must become canonical
+- canonical `Quaternion(x,y,z,w)` becomes Franka `left_end_pose`
+  `[x,y,z,qx,qy,qz,qw]`;
+- Policy action `[x,y,z,qx,qy,qz,qw,gripper]` becomes canonical
   `Quaternion(x=qx,y=qy,z=qz,w=qw)`.
 
-The reviewed organizer checkout
-`6f5a981b34232fe77812b818a6ad7a4e6b8728ac` used positional unpacking in both
-places and therefore fails the identity-quaternion probe. Keep this Policy and
-dataset in official `wxyz` order. After the organizers approve the
-participant-side compatibility patch, prepare the exact checkout and prove the
-bridge before loading the model:
+The pinned organizer checkout
+`6f5a981b34232fe77812b818a6ad7a4e6b8728ac` already uses this positional XYZW
+mapping. Do not apply the former participant-side WXYZ patch. Keep the checkout
+clean and prove both directions before loading the model:
 
 ```bash
 git -C "$WORLD_ARENA_ROOT" checkout \
   6f5a981b34232fe77812b818a6ad7a4e6b8728ac
 
-n0-twam track32 bridge-patch \
-  --worldarena-root "$WORLD_ARENA_ROOT"
-
 n0-twam track32 bridge-audit \
   --worldarena-root "$WORLD_ARENA_ROOT"
 ```
 
-`bridge-patch` accepts only the pinned revision and an otherwise clean
-`real_world_benchmark/` tree. It applies one packaged patch and then runs the
-same two-direction semantic probe as `bridge-audit`. The audit also binds the
-bridge and official Hub worker file hashes. It rejects the unpatched revision,
-shadow imports, unrelated worker-code changes, failure to propagate Policy
-metadata to the canonical `right` control arm, or either wrong quaternion
-direction.
+`bridge-audit` binds the unmodified bridge and official Hub worker file hashes.
+Its non-identity quaternion probe rejects a WXYZ reorder in either direction,
+shadow imports, any `real_world_benchmark/` modification, or failure to
+propagate Policy metadata to the canonical `right` control arm.
 
 For the official outbound HTTPS long-poll process, set the organizer-provided
 values and use the single public launcher:
@@ -374,14 +376,14 @@ export HUB_TOKEN=ORGANIZER_BEARER_TOKEN  # optional
 bash run_track32_franka_worker.sh
 ```
 
-The script idempotently applies/audits the pinned patch and then invokes the
-official WorldArena `run_policy_hub_worker`. The token is copied to a dedicated
+The script audits the clean pinned XYZW bridge and then invokes the official
+WorldArena `run_policy_hub_worker`. The token is copied to a dedicated
 environment variable and is never placed in the command line. `POLICY_ID` must
 equal `policy_id` in the signed policy config. The worker accepts HTTPS only;
 `--allow-local-http` permits only a loopback dummy Hub, and `--dry-run` performs
 all identity/config checks without loading N0 or opening a network connection.
-If the organizers publish a newer corrected revision, do not apply this pinned
-patch: pass its exact revision and bridge SHA to `n0-twam track32 worker`.
+If the organizers publish a newer revision, pass its exact revision and bridge
+SHA to `n0-twam track32 worker` after independently verifying the XYZW mapping.
 
 ## Evidence boundary
 

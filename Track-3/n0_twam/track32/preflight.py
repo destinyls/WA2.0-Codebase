@@ -20,15 +20,16 @@ from n0_twam.checkpointing.strict_checkpoint_snapshot import (
     capture_strict_checkpoint_snapshot,
 )
 from n0_twam.configs.twam_track32_franka_cfg import twam_track32_franka_cfg
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    TRACK32_PROFILE_ID,
+)
 from n0_twam.integrations.worldarena.franka_artifacts import (
     MODEL_ACTION_SCHEMA,
     SOURCE_ACTION_SCHEMA,
     verify_franka_training_artifacts,
 )
 from n0_twam.integrations.worldarena.franka_manifest import sha256_file
-
-TRACK32_PROFILE_ID = "franka_track32_vision_only_v1"
-DERIVED_ACTION_SCHEMA = "franka_ee10_rot6d_columns_v1"
 
 
 def _required_env(name: str) -> str:
@@ -341,7 +342,7 @@ def run_preflight() -> dict[str, object]:
         "accelerator_profile": _required_env("N0_TRACK32_ACCELERATOR_PROFILE"),
         "tactile_profile": "vision_only",
         "tactile_mode": "disabled",
-        "action_route": "end_pose_base8_wxyz_to_ee10_to_ee20_mask_0_9",
+        "action_route": "end_pose_base8_xyzw_to_ee10_to_ee20_mask_0_9",
         "train_view_sha256": artifacts.train_view.view_sha256,
         "validation_view_sha256": (
             None

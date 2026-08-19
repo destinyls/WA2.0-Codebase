@@ -413,17 +413,9 @@ def _track32_pack_predictions_command(args: argparse.Namespace) -> dict[str, obj
     )
 
 
-def _track32_bridge_patch_command(args: argparse.Namespace) -> dict[str, object]:
-    from n0_twam.integrations.worldarena.franka_bridge_patch import (
-        apply_pinned_worldarena_bridge_patch,
-    )
-
-    return apply_pinned_worldarena_bridge_patch(args.worldarena_root)
-
-
 def _track32_bridge_audit_command(args: argparse.Namespace) -> dict[str, object]:
     from n0_twam.integrations.worldarena.franka_official_worker import (
-        PINNED_PATCHED_BRIDGE_SHA256,
+        PINNED_ORIGINAL_BRIDGE_SHA256,
         PINNED_WORLD_ARENA_REVISION,
         audit_worldarena_franka_bridge,
     )
@@ -432,14 +424,14 @@ def _track32_bridge_audit_command(args: argparse.Namespace) -> dict[str, object]
         args.worldarena_root,
         expected_revision=args.expected_revision or PINNED_WORLD_ARENA_REVISION,
         expected_bridge_sha256=(
-            args.expected_bridge_sha256 or PINNED_PATCHED_BRIDGE_SHA256
+            args.expected_bridge_sha256 or PINNED_ORIGINAL_BRIDGE_SHA256
         ),
     )
 
 
 def _track32_worker_command(args: argparse.Namespace) -> dict[str, object]:
     from n0_twam.integrations.worldarena.franka_official_worker import (
-        PINNED_PATCHED_BRIDGE_SHA256,
+        PINNED_ORIGINAL_BRIDGE_SHA256,
         PINNED_WORLD_ARENA_REVISION,
         run_official_franka_worker,
     )
@@ -448,7 +440,7 @@ def _track32_worker_command(args: argparse.Namespace) -> dict[str, object]:
         worldarena_root=args.worldarena_root,
         expected_revision=args.expected_revision or PINNED_WORLD_ARENA_REVISION,
         expected_bridge_sha256=(
-            args.expected_bridge_sha256 or PINNED_PATCHED_BRIDGE_SHA256
+            args.expected_bridge_sha256 or PINNED_ORIGINAL_BRIDGE_SHA256
         ),
         config_path=args.config,
         hub_url=args.hub_url,
@@ -735,16 +727,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_predictions.add_argument("--output", type=Path, required=True)
     pack_predictions.set_defaults(handler=_track32_pack_predictions_command)
 
-    bridge_patch = track32_commands.add_parser(
-        "bridge-patch",
-        help="apply the pinned Franka WXYZ fix to a clean WorldArena checkout",
-    )
-    bridge_patch.add_argument("--worldarena-root", type=Path, required=True)
-    bridge_patch.set_defaults(handler=_track32_bridge_patch_command)
-
     bridge_audit = track32_commands.add_parser(
         "bridge-audit",
-        help="prove the WorldArena Franka WXYZ/XYZW bridge in both directions",
+        help="prove the unmodified WorldArena Franka XYZW bridge in both directions",
     )
     bridge_audit.add_argument("--worldarena-root", type=Path, required=True)
     bridge_audit.add_argument("--expected-revision")

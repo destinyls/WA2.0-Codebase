@@ -33,7 +33,7 @@ class _Backend:
         }
         assert current_ee20.shape == (20,)
         poses = np.repeat(
-            np.asarray([[0, 0, 0, 1, 0, 0, 0, 0.5]], dtype=np.float32),
+            np.asarray([[0, 0, 0, 0, 0, 0, 1, 0.5]], dtype=np.float32),
             12,
             axis=0,
         )
@@ -100,7 +100,7 @@ def _observation(tmp_path: Path) -> Path:
         path,
         cam_high=np.zeros((8, 8, 3), dtype=np.uint8),
         cam_left_wrist=np.ones((8, 8, 3), dtype=np.uint8),
-        left_end_pose=np.asarray((0, 0, 0, 1, 0, 0, 0), dtype=np.float32),
+        left_end_pose=np.asarray((0, 0, 0, 0, 0, 0, 1), dtype=np.float32),
         joint_qpos=np.asarray((0, 0, 0, 0, 0, 0, 0, 0.5), dtype=np.float32),
     )
     return path

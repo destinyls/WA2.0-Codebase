@@ -17,9 +17,15 @@ from n0_twam.data.encoder_source_identity import (
     validate_encoder_source_identity,
 )
 
+from .franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
+    TRACK32_PROFILE_ID,
+)
 from .franka_manifest import canonical_sha256, sha256_file
 
-SERVE_BUNDLE_SCHEMA_VERSION = 1
+SERVE_BUNDLE_SCHEMA_VERSION = 2
 
 
 def _overlaps(left: Path, right: Path) -> bool:
@@ -83,15 +89,21 @@ def build_franka_serve_bundle(
         raise ValueError("checkpoint identity differs from requested serve source")
     meta = snapshot.train_meta
     if (
-        meta.get("track32_profile_id") != "franka_track32_vision_only_v1"
+        meta.get("track32_profile_id") != TRACK32_PROFILE_ID
         or meta.get("action_schema") != "ee20_absee"
+        or meta.get("source_action_schema") != FRANKA_ACTION_SCHEMA
+        or meta.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
         or meta.get("tactile_profile", "vision_only") != "vision_only"
         or meta.get("tactile_mode") != "disabled"
         or meta.get("used_action_channel_ids") != list(range(10))
     ):
         raise ValueError("checkpoint is not a compatible Franka Track 3.2 model")
     normalizer_payload = _load_json(normalizer_path, label="Franka normalizer")
-    if normalizer_payload.get("normalizer_sha256") != normalizer_sha256:
+    if (
+        normalizer_payload.get("normalizer_sha256") != normalizer_sha256
+        or normalizer_payload.get("source_action_schema") != FRANKA_ACTION_SCHEMA
+        or normalizer_payload.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
+    ):
         raise ValueError("normalizer semantic SHA256 differs from request")
     encoder_identity = validate_encoder_source_identity(
         build_encoder_source_identity(base_root)
@@ -130,7 +142,7 @@ def build_franka_serve_bundle(
         core: dict[str, object] = {
             "schema_version": SERVE_BUNDLE_SCHEMA_VERSION,
             "status": "complete",
-            "profile": "franka_track32_vision_only_v1",
+            "profile": TRACK32_PROFILE_ID,
             "run_role": meta.get("run_role"),
             "checkpoint_root": str(checkpoint_root),
             "checkpoint_identity": checkpoint_identity,
@@ -140,6 +152,9 @@ def build_franka_serve_bundle(
             "normalizer_sha256": normalizer_sha256,
             "normalizer_file_sha256": normalizer_file_sha256,
             "action_schema": "ee20_absee",
+            "wire_action_schema": FRANKA_ACTION_SCHEMA,
+            "derived_action_schema": DERIVED_ACTION_SCHEMA,
+            "quaternion_order": FRANKA_QUATERNION_ORDER,
             "active_action_channel_ids": list(range(10)),
             "tactile_profile": "vision_only",
             "tactile_mode": "disabled",
@@ -187,8 +202,11 @@ def verify_franka_serve_bundle(
         receipt.get("schema_version") != SERVE_BUNDLE_SCHEMA_VERSION
         or receipt.get("status") != "complete"
         or receipt.get("bundle_identity_sha256") != canonical_sha256(core)
-        or receipt.get("profile") != "franka_track32_vision_only_v1"
+        or receipt.get("profile") != TRACK32_PROFILE_ID
         or receipt.get("action_schema") != "ee20_absee"
+        or receipt.get("wire_action_schema") != FRANKA_ACTION_SCHEMA
+        or receipt.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
+        or receipt.get("quaternion_order") != FRANKA_QUATERNION_ORDER
         or receipt.get("active_action_channel_ids") != list(range(10))
         or receipt.get("tactile_mode") != "disabled"
         or receipt.get("component_names")
@@ -237,7 +255,11 @@ def verify_franka_serve_bundle(
     ):
         raise ValueError("serve bundle normalizer bytes changed")
     normalizer_payload = _load_json(normalizer_path, label="serve normalizer")
-    if normalizer_payload.get("normalizer_sha256") != receipt.get("normalizer_sha256"):
+    if (
+        normalizer_payload.get("normalizer_sha256") != receipt.get("normalizer_sha256")
+        or normalizer_payload.get("source_action_schema") != FRANKA_ACTION_SCHEMA
+        or normalizer_payload.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
+    ):
         raise ValueError("serve normalizer semantic identity changed")
     return receipt
 

@@ -17,12 +17,15 @@ import numpy as np
 import numpy.typing as npt
 
 from .franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
     ee10_to_end_pose8,
     embed_ee10_in_ee20,
     end_pose8_to_ee10,
     extract_ee10_from_ee20,
     interpolate_end_pose8,
-    normalize_quaternion_wxyz,
+    normalize_quaternion_xyzw,
 )
 from .franka_serve_bundle import verify_franka_serve_bundle
 
@@ -412,8 +415,8 @@ class DirectN0FrankaBackend:
     ) -> npt.NDArray[np.uint8]:
         """Decode normalized Wan latents in bounded HCU batches."""
 
-        from diffusers.video_processor import VideoProcessor
         import torch
+        from diffusers.video_processor import VideoProcessor
 
         if (
             isinstance(batch_size, bool)
@@ -501,9 +504,9 @@ def _subsample_grounding_history(
     return tuple(selected)
 
 
-def _angle_wxyz(left: npt.ArrayLike, right: npt.ArrayLike) -> float:
-    first = normalize_quaternion_wxyz(left).reshape(4)
-    second = normalize_quaternion_wxyz(right).reshape(4)
+def _angle_xyzw(left: npt.ArrayLike, right: npt.ArrayLike) -> float:
+    first = normalize_quaternion_xyzw(left).reshape(4)
+    second = normalize_quaternion_xyzw(right).reshape(4)
     cosine = float(np.clip(abs(np.dot(first, second)), 0.0, 1.0))
     return float(2.0 * np.arccos(cosine))
 
@@ -531,7 +534,7 @@ def _safe_chunk(
             target[:3] = previous[:3] + delta * (
                 safety.max_translation_step_m / distance
             )
-        angle = _angle_wxyz(previous[3:7], target[3:7])
+        angle = _angle_xyzw(previous[3:7], target[3:7])
         if angle > safety.max_rotation_step_rad:
             fraction = safety.max_rotation_step_rad / angle
             target = interpolate_end_pose8(previous, target, fraction).reshape(8)
@@ -541,7 +544,7 @@ def _safe_chunk(
             previous[7] + safety.max_gripper_step,
         )
         target[7] = np.clip(target[7], safety.gripper_min, safety.gripper_max)
-        target[3:7] = normalize_quaternion_wxyz(target[3:7])
+        target[3:7] = normalize_quaternion_xyzw(target[3:7])
         output[index] = target
         previous = target
     return np.ascontiguousarray(output)
@@ -809,7 +812,9 @@ class Policy:
                 "control_arm": FRANKA_CONTROL_ARM,
                 "action_dim": 8,
                 "chunk_size": self.config.external_chunk_actions,
-                "quaternion_order": "wxyz",
+                "quaternion_order": FRANKA_QUATERNION_ORDER,
+                "wire_action_schema": FRANKA_ACTION_SCHEMA,
+                "derived_action_schema": DERIVED_ACTION_SCHEMA,
                 "tactile_profile": "vision_only",
                 "tactile_mode": "disabled",
                 "task_id": str(new_obs.get("task_id", "")),

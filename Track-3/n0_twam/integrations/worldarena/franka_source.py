@@ -14,9 +14,9 @@ import numpy.typing as npt
 
 from .franka_actions import end_pose8_to_ee10
 from .franka_manifest import (
+    OFFICIAL_TASKS,
     FrankaDatasetInventory,
     FrankaFileRecord,
-    OFFICIAL_TASKS,
 )
 
 SOURCE_FPS = 15
@@ -246,7 +246,7 @@ def audit_episode(
 
 
 def read_end_pose8(episode: FrankaEpisode) -> npt.NDArray[np.float32]:
-    """Read the official base-frame absolute end-pose labels."""
+    """Read base-frame labels as ``[xyz, qx, qy, qz, qw, gripper]``."""
 
     with h5py.File(episode.hdf5_path, "r") as handle:
         pose = np.asarray(handle[END_POSE_PATH][:, :8], dtype=np.float32)

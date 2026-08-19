@@ -18,8 +18,13 @@ from n0_twam.evaluation.franka_prediction_io import (
     require_prediction_unchanged,
 )
 from n0_twam.evaluation.sealed_artifact_io import validate_sha256
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
+)
 
-PREDICTION_SCHEMA_VERSION = 1
+PREDICTION_SCHEMA_VERSION = 2
 PREDICTION_ARTIFACT_TYPE = "n0_twam_track32_offline_predictions"
 OFFICIAL_TASKS = frozenset(("clear_up", "pour", "wipe"))
 OFFICIAL_VIEWS = ("cam_high", "cam_left_wrist")
@@ -34,6 +39,9 @@ _EXPECTED_KEYS = frozenset(
         "seed",
         "run_role",
         "prediction_mode",
+        "wire_action_schema",
+        "derived_action_schema",
+        "quaternion_order",
         "view_names",
         "frame_offsets",
         "action_offsets",
@@ -119,6 +127,24 @@ def _metadata(arrays: Mapping[str, npt.NDArray[np.generic]]) -> dict[str, object
     )
     if prediction_mode not in {"teacher_action", "policy_action"}:
         raise ValueError("prediction_mode must be teacher_action or policy_action")
+    wire_action_schema = _string(
+        _scalar(arrays["wire_action_schema"], label="wire_action_schema"),
+        label="wire_action_schema",
+    )
+    derived_action_schema = _string(
+        _scalar(arrays["derived_action_schema"], label="derived_action_schema"),
+        label="derived_action_schema",
+    )
+    quaternion_order = _string(
+        _scalar(arrays["quaternion_order"], label="quaternion_order"),
+        label="quaternion_order",
+    )
+    if (
+        wire_action_schema != FRANKA_ACTION_SCHEMA
+        or derived_action_schema != DERIVED_ACTION_SCHEMA
+        or quaternion_order != FRANKA_QUATERNION_ORDER
+    ):
+        raise ValueError("prediction action representation contract mismatch")
     return {
         "checkpoint_identity_sha256": validate_sha256(
             _string(
@@ -151,6 +177,9 @@ def _metadata(arrays: Mapping[str, npt.NDArray[np.generic]]) -> dict[str, object
         "seed": seed,
         "run_role": run_role,
         "prediction_mode": prediction_mode,
+        "wire_action_schema": wire_action_schema,
+        "derived_action_schema": derived_action_schema,
+        "quaternion_order": quaternion_order,
     }
 
 
@@ -159,7 +188,7 @@ def load_franka_predictions(raw: bytes) -> FrankaPredictions:
         with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
             if set(archive.files) != _EXPECTED_KEYS:
                 raise ValueError(
-                    "prediction artifact keys differ from schema version 1"
+                    "prediction artifact keys differ from schema version 2"
                 )
             arrays = {name: np.asarray(archive[name]).copy() for name in archive.files}
     except (OSError, ValueError) as exc:
@@ -231,6 +260,13 @@ def load_franka_predictions(raw: bytes) -> FrankaPredictions:
         raise ValueError("action_valid must be bool [N,A]")
     if np.any(action_valid.sum(axis=1) == 0):
         raise ValueError("every sample must contain at least one valid future action")
+    for label, poses in (
+        ("predicted", predicted_action),
+        ("target", target_action),
+    ):
+        quaternion_norms = np.linalg.norm(poses[..., 3:7], axis=-1)
+        if not np.allclose(quaternion_norms[action_valid], 1.0, atol=1e-4, rtol=1e-4):
+            raise ValueError(f"{label} valid end-pose quaternions must be unit XYZW")
 
     metadata["frame_offsets"] = list(frame_offsets)
     metadata["action_offsets"] = list(action_offsets)
@@ -265,6 +301,9 @@ def publish_franka_predictions(
         "seed",
         "run_role",
         "prediction_mode",
+        "wire_action_schema",
+        "derived_action_schema",
+        "quaternion_order",
     }
     required_arrays = _EXPECTED_KEYS - {
         "schema_version",

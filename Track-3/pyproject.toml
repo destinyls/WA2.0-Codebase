@@ -87,9 +87,6 @@ include = ["n0_twam*"]
 [tool.setuptools.exclude-package-data]
 "*" = ["__pycache__/*", "*.pyc"]
 
-[tool.setuptools.package-data]
-"n0_twam.integrations.worldarena" = ["patches/*.patch"]
-
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

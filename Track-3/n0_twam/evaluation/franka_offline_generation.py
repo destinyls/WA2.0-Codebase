@@ -25,6 +25,9 @@ from n0_twam.evaluation.franka_prediction_io import (
 )
 from n0_twam.evaluation.sealed_artifact_io import validate_sha256
 from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    FRANKA_QUATERNION_ORDER,
     ee10_to_end_pose8,
     embed_ee10_in_ee20,
     extract_ee10_from_ee20,
@@ -322,6 +325,9 @@ def generate_franka_offline_predictions(
             "seed": seed,
             "run_role": "development",
             "prediction_mode": "policy_action",
+            "wire_action_schema": FRANKA_ACTION_SCHEMA,
+            "derived_action_schema": DERIVED_ACTION_SCHEMA,
+            "quaternion_order": FRANKA_QUATERNION_ORDER,
         },
         arrays=arrays,
     )

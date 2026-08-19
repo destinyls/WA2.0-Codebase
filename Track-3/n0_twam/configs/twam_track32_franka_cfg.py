@@ -1,8 +1,8 @@
 # Copyright 2025-2026 NeoteAI Team. All rights reserved.
 """Official WorldArena Track 3.2 Franka vision-only post-training config.
 
-The official wire action is an 8D base-frame end pose
-``[x, y, z, qw, qx, qy, qz, gripper]``.  Conversion maps it to one EE10 arm
+The verified wire action is an 8D base-frame end pose
+``[x, y, z, qx, qy, qz, qw, gripper]``.  Conversion maps it to one EE10 arm
 (``xyz + rot6d + gripper``), embeds that arm in the released 20D action head,
 and masks channels 10..19.  Tactile data and tactile loss are disabled
 explicitly; the released tactile weights remain frozen and byte-preserved.
@@ -16,13 +16,18 @@ from pathlib import Path
 
 from easydict import EasyDict
 
+from n0_twam.integrations.worldarena.franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    TRACK32_PROFILE_ID,
+)
 from n0_twam.integrations.worldarena.franka_views import (
     DEVELOPMENT_TRAIN_VIEW,
     DEVELOPMENT_VALIDATION_VIEW,
     FINAL_REFIT_VIEW,
 )
-
 from n0_twam.tactile_profiles import VISION_ONLY, validate_tactile_profile_config
+
 from .twam_base_cfg import twam_base_cfg
 
 
@@ -97,7 +102,7 @@ def _artifact_identity_from_environment() -> dict[str, object] | None:
         raise ValueError("Track 3.2 artifact identity environment is incomplete")
     return {
         "schema_version": 1,
-        "profile": "franka_track32_vision_only_v1",
+        "profile": TRACK32_PROFILE_ID,
         "run_role": _ROLE,
         "source_records_sha256": (
             "67118a93230e13a5ecf8072df9cad4b30882367471017b4f1b49e43b6c8d4635"
@@ -139,7 +144,7 @@ cfg.accelerator_profile = os.environ.get("N0_TRACK32_ACCELERATOR_PROFILE", "port
 if cfg.accelerator_profile not in {"portable", "hcu_performance"}:
     raise ValueError("invalid N0_TRACK32_ACCELERATOR_PROFILE")
 cfg.training_profile_id = None
-cfg.track32_profile_id = "franka_track32_vision_only_v1"
+cfg.track32_profile_id = TRACK32_PROFILE_ID
 cfg.track32_artifact_identity = _artifact_identity_from_environment()
 cfg.capture_runtime_provenance = True
 cfg.sampler_coverage_mode = "pad_global"
@@ -167,8 +172,8 @@ cfg.freeze_tactile_parameters = True
 
 # Keep the released dual-arm 20D head intact. Only the left/first EE10 is active.
 cfg.action_schema = "ee20_absee"
-cfg.source_action_schema = "franka_end_pose_base_wxyz8_v1"
-cfg.derived_action_schema = "franka_ee10_rot6d_columns_v1"
+cfg.source_action_schema = FRANKA_ACTION_SCHEMA
+cfg.derived_action_schema = DERIVED_ACTION_SCHEMA
 cfg.action_dim = 20
 cfg.action_delta_mode = "none"
 cfg.action_per_frame = 6

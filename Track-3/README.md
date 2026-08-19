@@ -281,8 +281,8 @@ video/tactile inventories under `$N0_LEROBOT/train759`.
 The single preparation command pins
 `WorldArena/WorldArena2.0_Franka_FR3@aed59b39c5a903be5e435c13c0ed1efdd54d5ad9`,
 verifies and downloads 600 episodes, converts both RGB streams and 8D
-`end_pose_base` labels, creates development/final views, fits the normalizers,
-and encodes the video latents. The download is resumable.
+scalar-last XYZW `end_pose_base` labels, creates development/final views, fits
+the normalizers, and encodes the video latents. The download is resumable.
 
 ```bash
 export N0_FRANKA_WORK="$N0_WORK/track32-franka"
@@ -491,26 +491,26 @@ organizer hidden-test or simulator-success result. See
 |---|---|
 | Dataset | Official Franka release or manifest-bound AgileX dual-arm data |
 | Profiles | Franka: `vision_only`; AgileX: `vision_tactile`, `mixed`, `vision_only` |
-| Franka action | `[x, y, z, qw, qx, qy, qz, gripper]` -> EE10 -> EE20 mask |
+| Franka action | `[x, y, z, qx, qy, qz, qw, gripper]` -> EE10 -> EE20 mask |
 | AgileX action | Native 14D absolute dual-arm qpos (`6+1` per arm) |
 | Default recipe | 1500 optimizer steps, save every 300, validate every 100 |
 | Entry point | `n0-twam track32` (`./run_track32_franka.sh` for Franka) |
 
-The Franka route has no tactile input. Tactile-only parameters remain in the
-checkpoint-compatible model structure but are frozen and excluded from AdamW.
-`joint_qpos` is an observation/fallback signal, not the official action label.
+### Franka XYZW contract revision
 
-The AgileX route keeps the 14D joint action native. A fresh released 20D model
-reuses all compatible non-action weights and deterministically reinitializes
-the complete 14D action projection; it never slices or relabels EE20 channels.
-See [TRACK32_AGILEX.md](docs/TRACK32_AGILEX.md) for its strict data and training
-contract.
+The Franka wire command is scalar-last `xyzw`; it is converted geometrically
+from pose8 to EE10 and embedded into channels `0..9` of the released EE20 head.
+The frozen identities are `franka_end_pose_base_xyzw8_v2`,
+`franka_ee10_rot6d_columns_from_xyzw_v2`, and
+`franka_track32_vision_only_xyzw_v2`.
 
-For AgileX, first publish the conversion/latent identities with
-`agilex-build-artifacts`, then use `agilex-template`, `agilex-train`,
-`agilex-serve-bundle`, and `agilex-policy-check` in that order. The generated
-training request is byte-hash-bound across parent preflight, child preflight,
-launch, and completion.
+This is incompatible with the former WXYZ/v1 lineage. Converted repositories,
+normalizers, checkpoints, prediction artifacts, serve bundles, and replay
+receipts must be regenerated, not resumed or relabeled. The old participant
+bridge patch is removed; the worker audits a clean pinned WorldArena checkout
+with a non-identity XYZW probe in both directions before loading the Policy.
+
+Franka remains `vision_only`: tactile parameters stay frozen; `joint_qpos` is observation-only.
 
 ### AgileX: build artifacts and train
 
@@ -656,8 +656,8 @@ n0-twam track32 policy-replay \
   --output "$N0_FRANKA_WORK/offline-policy-replay.json"
 ```
 
-Only after organizer approval, robot-cell calibration, credentials, and bridge
-verification should the outbound worker be started:
+Only after organizer approval, robot-cell calibration, credentials, and the
+launcher's clean-checkout XYZW bridge audit should the worker be started:
 
 ```bash
 export WORLD_ARENA_ROOT=/absolute/path/to/WorldArena-2.0

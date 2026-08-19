@@ -16,8 +16,12 @@ from n0_twam.integrations.univtac.convert_lerobot import (
     freeze_episode_action_config,
 )
 
-from .franka_actions import DERIVED_ACTION_SCHEMA, end_pose8_to_ee10
-from .franka_source import FrankaEpisode, SOURCE_FPS, TASK_PROMPTS, read_end_pose8
+from .franka_actions import (
+    DERIVED_ACTION_SCHEMA,
+    FRANKA_ACTION_SCHEMA,
+    end_pose8_to_ee10,
+)
+from .franka_source import SOURCE_FPS, TASK_PROMPTS, FrankaEpisode, read_end_pose8
 
 EE10_CHANNEL_NAMES = (
     "x",
@@ -183,7 +187,9 @@ def write_franka_lerobot_dataset(
         raise ValueError("first Franka episode has no convertible frames") from error
     features = build_lerobot_features(first_frame)
     try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset  # type: ignore[import-not-found]
+        from lerobot.datasets.lerobot_dataset import (
+            LeRobotDataset,  # type: ignore[import-not-found]
+        )
     except ImportError as error:  # pragma: no cover
         raise ImportError("LeRobot 0.3.3 is required for Franka conversion") from error
     dataset = LeRobotDataset.create(
@@ -204,7 +210,7 @@ def write_franka_lerobot_dataset(
     freeze_episode_action_config(output)
     return {
         "schema_version": 1,
-        "source_action_schema": "franka_end_pose_base_wxyz8_v1",
+        "source_action_schema": FRANKA_ACTION_SCHEMA,
         "derived_action_schema": DERIVED_ACTION_SCHEMA,
         "label_offset": "next_recorded_end_pose_v1",
         "tactile_profile": "vision_only",

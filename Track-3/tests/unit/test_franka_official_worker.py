@@ -67,10 +67,10 @@ class _GoodBridge:
                 pose.position_m.x,
                 pose.position_m.y,
                 pose.position_m.z,
-                quaternion.w,
                 quaternion.x,
                 quaternion.y,
                 quaternion.z,
+                quaternion.w,
             ),
             dtype=np.float32,
         )
@@ -79,10 +79,10 @@ class _GoodBridge:
     def actions_array_to_action_packet(actions, **kwargs):
         row = np.asarray(actions)[0]
         quaternion = _Quaternion(
-            x=float(row[4]),
-            y=float(row[5]),
-            z=float(row[6]),
-            w=float(row[3]),
+            x=float(row[3]),
+            y=float(row[4]),
+            z=float(row[5]),
+            w=float(row[6]),
         )
         action = SimpleNamespace(
             arm_id=kwargs.get("control_arm"),
@@ -115,10 +115,10 @@ class _BrokenInputBridge(_GoodBridge):
                 pose.position_m.x,
                 pose.position_m.y,
                 pose.position_m.z,
+                quaternion.w,
                 quaternion.x,
                 quaternion.y,
                 quaternion.z,
-                quaternion.w,
             ),
             dtype=np.float32,
         )
@@ -128,7 +128,12 @@ class _BrokenOutputBridge(_GoodBridge):
     @staticmethod
     def actions_array_to_action_packet(actions, **kwargs):
         row = np.asarray(actions)[0]
-        quaternion = _Quaternion(*[float(value) for value in row[3:7]])
+        quaternion = _Quaternion(
+            x=float(row[4]),
+            y=float(row[5]),
+            z=float(row[6]),
+            w=float(row[3]),
+        )
         action = SimpleNamespace(
             arm_id=kwargs.get("control_arm"),
             target_pose_base=_Pose(orientation_xyzw=quaternion),
@@ -171,40 +176,40 @@ def _identity_repo(tmp_path: Path) -> tuple[Path, str]:
     return root, _git(root, "rev-parse", "HEAD")
 
 
-def test_wxyz_bridge_probe_checks_both_directions() -> None:
+def test_xyzw_bridge_probe_checks_both_directions() -> None:
     report = _probe_loaded_bridge(_GoodBridge, _Schema)
 
     assert report["status"] == "pass"
     assert report["control_arm"] == "right"
-    assert report["identity_new_obs_pose7"][3:] == [1.0, 0.0, 0.0, 0.0]
-    assert report["identity_action_packet_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+    expected = np.asarray((0.1, 0.2, 0.3, np.sqrt(0.86)))
+    np.testing.assert_allclose(report["probe_new_obs_pose7"][3:], expected)
+    np.testing.assert_allclose(report["probe_action_packet_xyzw"], expected)
 
 
 @pytest.mark.parametrize(
     ("bridge", "message"),
     (
-        (_BrokenInputBridge, "canonical-xyzw to Franka-new_obs-wxyz"),
-        (_BrokenOutputBridge, "Franka-action-wxyz to canonical-xyzw"),
+        (_BrokenInputBridge, "canonical-xyzw to Franka-new_obs-xyzw"),
+        (_BrokenOutputBridge, "Franka-action-xyzw to canonical-xyzw"),
     ),
 )
-def test_wxyz_bridge_probe_rejects_positional_quaternions(
+def test_xyzw_bridge_probe_rejects_wxyz_reordering(
     bridge: object, message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _probe_loaded_bridge(bridge, _Schema)
 
 
-def test_wxyz_bridge_probe_rejects_wrong_control_arm() -> None:
+def test_xyzw_bridge_probe_rejects_wrong_control_arm() -> None:
     with pytest.raises(ValueError, match="control-arm routing"):
         _probe_loaded_bridge(_WrongArmBridge, _Schema)
 
 
-def test_identity_ignores_unrelated_lfs_tree_but_binds_worker_code(
+def test_identity_requires_clean_unmodified_bridge_but_ignores_unrelated_lfs_tree(
     tmp_path: Path,
 ) -> None:
     root, revision = _identity_repo(tmp_path)
     bridge = root / BRIDGE_RELATIVE_PATH
-    bridge.write_text("bridge-v2\n", encoding="utf-8")
     (root / "assets" / "large.png").write_text("smudged bytes\n", encoding="utf-8")
     bridge_sha = hashlib.sha256(bridge.read_bytes()).hexdigest()
 
@@ -214,12 +219,22 @@ def test_identity_ignores_unrelated_lfs_tree_but_binds_worker_code(
         expected_bridge_sha256=bridge_sha,
     )
 
-    assert identity["changed_paths"] == [BRIDGE_RELATIVE_PATH.as_posix()]
+    assert identity["changed_paths"] == []
     assert identity["bridge_sha256"] == bridge_sha
 
+    bridge.write_text("bridge-v2\n", encoding="utf-8")
+    changed_sha = hashlib.sha256(bridge.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="unmodified"):
+        _capture_identity(
+            root,
+            expected_revision=revision,
+            expected_bridge_sha256=changed_sha,
+        )
+
+    _git(root, "checkout", "--", BRIDGE_RELATIVE_PATH.as_posix())
     extra = root / "real_world_benchmark" / "shadow.py"
     extra.write_text("raise RuntimeError\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="outside the audited bridge"):
+    with pytest.raises(ValueError, match="unmodified"):
         _capture_identity(
             root,
             expected_revision=revision,

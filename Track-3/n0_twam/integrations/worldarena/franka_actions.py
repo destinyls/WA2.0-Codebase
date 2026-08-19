@@ -10,10 +10,14 @@ import numpy.typing as npt
 
 FloatArray = npt.NDArray[np.float32]
 
-FRANKA_ACTION_SCHEMA = "franka_end_pose_base_wxyz8_v1"
-DERIVED_ACTION_SCHEMA = "franka_ee10_rot6d_columns_v1"
+FRANKA_ACTION_SCHEMA = "franka_end_pose_base_xyzw8_v2"
+DERIVED_ACTION_SCHEMA = "franka_ee10_rot6d_columns_from_xyzw_v2"
 MODEL_ACTION_SCHEMA = "ee20_absee"
 ACTIVE_ACTION_CHANNEL_IDS = tuple(range(10))
+FRANKA_QUATERNION_ORDER = "xyzw"
+TRACK32_PROFILE_ID = "franka_track32_vision_only_xyzw_v2"
+FRANKA_ACTION_ROUTE_ID = "franka_pose8_xyzw_to_ee20_v2"
+FRANKA_EMBODIMENT_PROFILE_ID = "franka_pose8_xyzw_ee20_v2"
 
 
 @dataclass(frozen=True)
@@ -24,7 +28,7 @@ class FrankaActionContract:
     derived_schema: str = DERIVED_ACTION_SCHEMA
     model_schema: str = MODEL_ACTION_SCHEMA
     source_frame: str = "robot_base"
-    quaternion_order: str = "wxyz"
+    quaternion_order: str = FRANKA_QUATERNION_ORDER
     rot6d_layout: str = "column0_then_column1"
     active_model_channels: tuple[int, ...] = ACTIVE_ACTION_CHANNEL_IDS
 
@@ -47,25 +51,25 @@ def _finite_array(
     return array
 
 
-def normalize_quaternion_wxyz(values: npt.ArrayLike) -> FloatArray:
-    """Normalize scalar-first quaternions and reject degenerate rotations."""
+def normalize_quaternion_xyzw(values: npt.ArrayLike) -> FloatArray:
+    """Normalize scalar-last quaternions and reject degenerate rotations."""
 
     quaternion = _finite_array(
         values,
         last_dim=4,
-        label="wxyz quaternion",
+        label="xyzw quaternion",
     )
     norm = np.linalg.norm(quaternion.astype(np.float64), axis=-1, keepdims=True)
     if np.any(norm < 1e-8):
-        raise ValueError("wxyz quaternion norm is too small")
+        raise ValueError("xyzw quaternion norm is too small")
     return (quaternion / norm).astype(np.float32, copy=False)
 
 
-def quaternion_wxyz_to_matrix(values: npt.ArrayLike) -> FloatArray:
-    """Convert scalar-first unit quaternions to rotation matrices."""
+def quaternion_xyzw_to_matrix(values: npt.ArrayLike) -> FloatArray:
+    """Convert scalar-last unit quaternions to rotation matrices."""
 
-    quaternion = normalize_quaternion_wxyz(values).astype(np.float64)
-    w, x, y, z = np.moveaxis(quaternion, -1, 0)
+    quaternion = normalize_quaternion_xyzw(values).astype(np.float64)
+    x, y, z, w = np.moveaxis(quaternion, -1, 0)
     matrix = np.empty(quaternion.shape[:-1] + (3, 3), dtype=np.float64)
     matrix[..., 0, 0] = 1.0 - 2.0 * (y * y + z * z)
     matrix[..., 0, 1] = 2.0 * (x * y - z * w)
@@ -79,7 +83,7 @@ def quaternion_wxyz_to_matrix(values: npt.ArrayLike) -> FloatArray:
     return matrix.astype(np.float32)
 
 
-def _matrix_to_quaternion_one(matrix: npt.NDArray[np.float64]) -> np.ndarray:
+def _matrix_to_quaternion_wxyz_one(matrix: npt.NDArray[np.float64]) -> np.ndarray:
     trace = float(np.trace(matrix))
     if trace > 0.0:
         scale = np.sqrt(trace + 1.0) * 2.0
@@ -128,8 +132,8 @@ def _matrix_to_quaternion_one(matrix: npt.NDArray[np.float64]) -> np.ndarray:
     return values / np.linalg.norm(values)
 
 
-def matrix_to_quaternion_wxyz(values: npt.ArrayLike) -> FloatArray:
-    """Convert proper 3x3 rotation matrices to scalar-first quaternions."""
+def matrix_to_quaternion_xyzw(values: npt.ArrayLike) -> FloatArray:
+    """Convert proper 3x3 rotation matrices to scalar-last quaternions."""
 
     matrix = np.asarray(values, dtype=np.float64)
     if matrix.ndim < 2 or matrix.shape[-2:] != (3, 3):
@@ -137,15 +141,16 @@ def matrix_to_quaternion_wxyz(values: npt.ArrayLike) -> FloatArray:
     if not np.isfinite(matrix).all():
         raise ValueError("rotation matrix contains non-finite values")
     flat = matrix.reshape(-1, 3, 3)
-    output = np.stack([_matrix_to_quaternion_one(item) for item in flat])
-    return output.reshape(matrix.shape[:-2] + (4,)).astype(np.float32)
+    wxyz = np.stack([_matrix_to_quaternion_wxyz_one(item) for item in flat])
+    xyzw = wxyz[:, (1, 2, 3, 0)]
+    return xyzw.reshape(matrix.shape[:-2] + (4,)).astype(np.float32)
 
 
 def end_pose8_to_ee10(values: npt.ArrayLike) -> FloatArray:
-    """Map official ``[xyz,wxyz,gripper]`` to N0's one-arm EE10 layout."""
+    """Map verified ``[xyz,xyzw,gripper]`` to N0's one-arm EE10 layout."""
 
     pose = _finite_array(values, last_dim=8, label="Franka end_pose_base")
-    matrix = quaternion_wxyz_to_matrix(pose[..., 3:7])
+    matrix = quaternion_xyzw_to_matrix(pose[..., 3:7])
     rot6d = np.concatenate((matrix[..., :, 0], matrix[..., :, 1]), axis=-1)
     return np.concatenate((pose[..., :3], rot6d, pose[..., 7:8]), axis=-1).astype(
         np.float32,
@@ -180,9 +185,9 @@ def ee10_to_end_pose8(
     """Decode one-arm EE10 and optionally preserve quaternion sign continuity."""
 
     action = _finite_array(values, last_dim=10, label="Franka EE10")
-    quaternion = matrix_to_quaternion_wxyz(rot6d_columns_to_matrix(action[..., 3:9]))
+    quaternion = matrix_to_quaternion_xyzw(rot6d_columns_to_matrix(action[..., 3:9]))
     if quaternion_reference is not None:
-        reference = normalize_quaternion_wxyz(quaternion_reference)
+        reference = normalize_quaternion_xyzw(quaternion_reference)
         try:
             reference = np.broadcast_to(reference, quaternion.shape)
         except ValueError as exc:
@@ -196,15 +201,15 @@ def ee10_to_end_pose8(
     ).astype(np.float32, copy=False)
 
 
-def slerp_quaternion_wxyz(
+def slerp_quaternion_xyzw(
     start: npt.ArrayLike,
     end: npt.ArrayLike,
     fraction: npt.ArrayLike,
 ) -> FloatArray:
-    """Shortest-arc scalar-first quaternion interpolation."""
+    """Shortest-arc scalar-last quaternion interpolation."""
 
-    first = normalize_quaternion_wxyz(start).astype(np.float64)
-    second = normalize_quaternion_wxyz(end).astype(np.float64)
+    first = normalize_quaternion_xyzw(start).astype(np.float64)
+    second = normalize_quaternion_xyzw(end).astype(np.float64)
     if first.shape != second.shape:
         raise ValueError("SLERP quaternion shapes must match")
     alpha = np.asarray(fraction, dtype=np.float64)
@@ -228,7 +233,7 @@ def slerp_quaternion_wxyz(
     )
     linear = (1.0 - alpha) * first + alpha * second
     output = np.where(close, linear, interpolated)
-    return normalize_quaternion_wxyz(output)
+    return normalize_quaternion_xyzw(output)
 
 
 def interpolate_end_pose8(
@@ -250,7 +255,7 @@ def interpolate_end_pose8(
     if not np.isfinite(alpha).all() or np.any(alpha < 0.0) or np.any(alpha > 1.0):
         raise ValueError("Franka interpolation fraction must be within [0, 1]")
     linear = first + alpha * (second - first)
-    quaternion = slerp_quaternion_wxyz(first[..., 3:7], second[..., 3:7], alpha[..., 0])
+    quaternion = slerp_quaternion_xyzw(first[..., 3:7], second[..., 3:7], alpha[..., 0])
     return np.concatenate(
         (linear[..., :3], quaternion, linear[..., 7:8]), axis=-1
     ).astype(np.float32)
@@ -277,16 +282,20 @@ __all__ = (
     "ACTIVE_ACTION_CHANNEL_IDS",
     "DERIVED_ACTION_SCHEMA",
     "FRANKA_ACTION_SCHEMA",
+    "FRANKA_ACTION_ROUTE_ID",
+    "FRANKA_EMBODIMENT_PROFILE_ID",
+    "FRANKA_QUATERNION_ORDER",
     "MODEL_ACTION_SCHEMA",
+    "TRACK32_PROFILE_ID",
     "FrankaActionContract",
     "ee10_to_end_pose8",
     "embed_ee10_in_ee20",
     "end_pose8_to_ee10",
     "extract_ee10_from_ee20",
     "interpolate_end_pose8",
-    "matrix_to_quaternion_wxyz",
-    "normalize_quaternion_wxyz",
-    "quaternion_wxyz_to_matrix",
+    "matrix_to_quaternion_xyzw",
+    "normalize_quaternion_xyzw",
+    "quaternion_xyzw_to_matrix",
     "rot6d_columns_to_matrix",
-    "slerp_quaternion_wxyz",
+    "slerp_quaternion_xyzw",
 )
