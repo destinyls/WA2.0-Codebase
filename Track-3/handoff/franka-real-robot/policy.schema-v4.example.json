@@ -1,0 +1,35 @@
+{
+  "schema_version": 4,
+  "policy_id": "REQUIRED_ORGANIZER_WORKER_KEY",
+  "serve_bundle": "/absolute/path/to/REQUIRED_SERVE_BUNDLE",
+  "serve_bundle_receipt_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+  "serve_output": "/absolute/new/path/to/REQUIRED_SERVE_OUTPUT",
+  "cuda_visible_device": "0",
+  "distributed_port": 29642,
+  "episode_seed": 20260810,
+  "max_chunk_actions": 12,
+  "external_chunk_actions": 6,
+  "video_inference_steps": 3,
+  "action_inference_steps": 4,
+  "live_contract": {
+    "conditioning_mode": "training_aligned_rgb_replan_v1",
+    "target_fps": 10,
+    "frame_interval_tolerance_ms": 15.0,
+    "max_state_image_skew_ms": 50.0,
+    "max_history_frames": 5,
+    "action_hz": 15,
+    "actions_per_replan": 6,
+    "future_start_index": 6,
+    "require_dual_camera_history": true,
+    "require_fresh_observation_after_chunk": true
+  },
+  "safety": {
+    "workspace_min": ["REQUIRED_X_MIN", "REQUIRED_Y_MIN", "REQUIRED_Z_MIN"],
+    "workspace_max": ["REQUIRED_X_MAX", "REQUIRED_Y_MAX", "REQUIRED_Z_MAX"],
+    "max_translation_step_m": "REQUIRED",
+    "max_rotation_step_rad": "REQUIRED",
+    "gripper_min": "REQUIRED_WIDTH_M",
+    "gripper_max": "REQUIRED_WIDTH_M",
+    "max_gripper_step": "REQUIRED_WIDTH_M"
+  }
+}

@@ -44,6 +44,7 @@ def build_franka_ee10_latent_targets(
     local_end_frame: int,
     latent_frame_ids: npt.ArrayLike,
     converted_actions: npt.ArrayLike,
+    converted_states: npt.ArrayLike,
     action_q01: npt.ArrayLike,
     action_q99: npt.ArrayLike,
     expected_slots_per_frame: int = 6,
@@ -54,8 +55,9 @@ def build_franka_ee10_latent_targets(
     observation row ``t``. The 15→10 RGB sampler is non-uniform, but every four
     sampled RGB frames advances exactly six source rows, so Wan anchors are
     strictly ``0, 6, 12, ...`` within a segment. As in the released N0 action
-    aligner, action frame zero is a repeated cold conditioning slot. Action
-    frame ``f>0`` contains the six targets following video anchor ``f-1``.
+    aligner, action frame zero is a repeated cold conditioning slot containing
+    the actual end pose observed at the first video anchor. Action frame
+    ``f>0`` contains the six targets following video anchor ``f-1``.
     """
 
     if local_start_frame < 0 or local_end_frame <= local_start_frame:
@@ -69,6 +71,11 @@ def build_franka_ee10_latent_targets(
         raise ValueError("converted Franka actions contain non-finite values")
     if actions.shape[0] != local_end_frame - local_start_frame:
         raise ValueError("converted action count differs from segment bounds")
+    states = np.asarray(_numpy(converted_states), dtype=np.float32)
+    if states.shape != actions.shape:
+        raise ValueError("converted Franka states must match action shape [T,10]")
+    if not np.isfinite(states).all():
+        raise ValueError("converted Franka states contain non-finite values")
     q01 = np.asarray(action_q01, dtype=np.float32)
     q99 = np.asarray(action_q99, dtype=np.float32)
     if q01.shape != (10,) or q99.shape != (10,) or not np.isfinite(q01).all():
@@ -83,7 +90,9 @@ def build_franka_ee10_latent_targets(
         raise ValueError("Franka latent anchors must advance six native 15-Hz rows")
 
     frame_count = int(anchors.size)
-    raw = np.repeat(actions[0][None, None, :], frame_count * 6, axis=0)
+    first_anchor_offset = int(anchors[0]) - local_start_frame
+    current_state = states[first_anchor_offset]
+    raw = np.repeat(current_state[None, None, :], frame_count * 6, axis=0)
     raw = raw.reshape(frame_count, 6, 10)
     valid = np.ones_like(raw, dtype=np.bool_)
     for latent_index, anchor in enumerate(anchors[:-1], start=1):

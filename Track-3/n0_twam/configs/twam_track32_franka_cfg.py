@@ -16,6 +16,7 @@ from pathlib import Path
 
 from easydict import EasyDict
 
+from n0_twam.actions.loss import build_action_loss_profile
 from n0_twam.integrations.worldarena.franka_actions import (
     DERIVED_ACTION_SCHEMA,
     FRANKA_ACTION_SCHEMA,
@@ -25,6 +26,7 @@ from n0_twam.integrations.worldarena.franka_views import (
     DEVELOPMENT_TRAIN_VIEW,
     DEVELOPMENT_VALIDATION_VIEW,
     FINAL_REFIT_VIEW,
+    TASK_FINETUNE_VIEWS,
 )
 from n0_twam.tactile_profiles import VISION_ONLY, validate_tactile_profile_config
 
@@ -75,9 +77,27 @@ _ARTIFACT_ROOT = _path_env("N0_TRACK32_ARTIFACT_ROOT", "/path/to/franka/artifact
 _LEROBOT_ROOT = _path_env("N0_TRACK32_LEROBOT_ROOT", "/path/to/franka/lerobot")
 _BASE_MODEL = _path_env("N0_BASE_MODEL", "/path/to/n0-twam-base")
 _EMPTY_EMBEDDING = _path_env("N0_EMPTY_EMBEDDING", _BASE_MODEL / "empty_emb.pt")
-_TRAIN_VIEW_ID = DEVELOPMENT_TRAIN_VIEW if _ROLE == "development" else FINAL_REFIT_VIEW
+_DEFAULT_TRAIN_VIEW_ID = (
+    DEVELOPMENT_TRAIN_VIEW if _ROLE == "development" else FINAL_REFIT_VIEW
+)
+_TRAIN_VIEW_ID = os.environ.get("N0_TRACK32_TRAIN_VIEW_ID", _DEFAULT_TRAIN_VIEW_ID)
 _VALIDATION_VIEW_ID = DEVELOPMENT_VALIDATION_VIEW if _ROLE == "development" else None
-_NORMALIZER_VIEW_ID = _TRAIN_VIEW_ID
+_DEFAULT_NORMALIZER_VIEW_ID = (
+    DEVELOPMENT_TRAIN_VIEW if _ROLE == "development" else FINAL_REFIT_VIEW
+)
+_NORMALIZER_VIEW_ID = os.environ.get(
+    "N0_TRACK32_NORMALIZER_SOURCE_VIEW_ID", _DEFAULT_NORMALIZER_VIEW_ID
+)
+if _ROLE == "development" and (
+    _TRAIN_VIEW_ID != DEVELOPMENT_TRAIN_VIEW
+    or _NORMALIZER_VIEW_ID != DEVELOPMENT_TRAIN_VIEW
+):
+    raise ValueError("development requires its standard train view and normalizer")
+if _ROLE == "final_refit" and (
+    _TRAIN_VIEW_ID not in {FINAL_REFIT_VIEW, *TASK_FINETUNE_VIEWS.values()}
+    or _NORMALIZER_VIEW_ID != FINAL_REFIT_VIEW
+):
+    raise ValueError("final_refit requires an approved train view and all600 normalizer")
 _NORMALIZER_PATH = _path_env(
     "N0_TRACK32_NORMALIZER_PATH",
     _ARTIFACT_ROOT / "normalizers" / f"{_NORMALIZER_VIEW_ID}.json",
@@ -92,14 +112,22 @@ def _artifact_identity_from_environment() -> dict[str, object] | None:
         "conversion_report_file_sha256": "N0_TRACK32_CONVERSION_REPORT_SHA256",
         "latent_inventory_file_sha256": ("N0_TRACK32_LATENT_INVENTORY_FILE_SHA256"),
         "train_view_sha256": "N0_TRACK32_TRAIN_VIEW_SHA256",
+        "normalizer_source_view_sha256": (
+            "N0_TRACK32_NORMALIZER_SOURCE_VIEW_SHA256"
+        ),
         "normalizer_sha256": "N0_TRACK32_NORMALIZER_SHA256",
     }
     present = {field: os.environ.get(name) for field, name in names.items()}
     validation = os.environ.get("N0_TRACK32_VALIDATION_VIEW_SHA256")
-    if not any(value for value in (*present.values(), validation)):
+    full_verification = os.environ.get(
+        "N0_TRACK32_FULL_VERIFICATION_RECEIPT_SHA256"
+    )
+    if not any(value for value in (*present.values(), validation, full_verification)):
         return None
     if any(not value for value in present.values()):
         raise ValueError("Track 3.2 artifact identity environment is incomplete")
+    if _TRAIN_VIEW_ID in TASK_FINETUNE_VIEWS.values() and not full_verification:
+        raise ValueError("task fine-tuning requires the all600 verification receipt")
     return {
         "schema_version": 1,
         "profile": TRACK32_PROFILE_ID,
@@ -108,8 +136,10 @@ def _artifact_identity_from_environment() -> dict[str, object] | None:
             "67118a93230e13a5ecf8072df9cad4b30882367471017b4f1b49e43b6c8d4635"
         ),
         "train_view_id": _TRAIN_VIEW_ID,
+        "normalizer_source_view_id": _NORMALIZER_VIEW_ID,
         "validation_view_id": _VALIDATION_VIEW_ID,
         "validation_view_sha256": validation,
+        "full_verification_receipt_sha256": full_verification,
         **{field: str(value) for field, value in present.items()},
     }
 
@@ -140,6 +170,10 @@ cfg.normalizer_source_view_path = str(
     _ARTIFACT_ROOT / "views" / f"{_NORMALIZER_VIEW_ID}.json"
 )
 cfg.run_role = _ROLE
+cfg.task_name = next(
+    (task for task, view_id in TASK_FINETUNE_VIEWS.items() if view_id == _TRAIN_VIEW_ID),
+    None,
+)
 cfg.accelerator_profile = os.environ.get("N0_TRACK32_ACCELERATOR_PROFILE", "portable")
 if cfg.accelerator_profile not in {"portable", "hcu_performance"}:
     raise ValueError("invalid N0_TRACK32_ACCELERATOR_PROFILE")
@@ -193,6 +227,15 @@ cfg.used_action_channel_ids = list(range(10))
 cfg.per_repo_used_action_channel_ids = {}
 cfg.inverse_used_action_channel_ids = list(range(10)) + [10] * 10
 cfg.action_norm_method = "q01q99"
+_ACTION_LOSS_PROFILE = build_action_loss_profile(
+    os.environ.get("N0_TRACK32_ACTION_LOSS_PROFILE", "legacy_v1"),
+    action_dim=cfg.action_dim,
+    action_horizon=cfg.action_per_frame,
+)
+cfg.action_loss_profile = _ACTION_LOSS_PROFILE.name
+cfg.action_loss_scale = _ACTION_LOSS_PROFILE.scale
+cfg.action_channel_loss_weights = list(_ACTION_LOSS_PROFILE.channel_weights)
+cfg.action_horizon_loss_weights = list(_ACTION_LOSS_PROFILE.horizon_weights)
 
 if _NORMALIZER_PATH.is_file():
     _normalizer = _load_json(_NORMALIZER_PATH, label="Franka EE20 normalizer")
@@ -224,8 +267,13 @@ cfg.checkpoint_compatibility = "strict"
 cfg.checkpoint_source_action_dim = 20
 cfg.checkpoint_source_action_schema = "ee20_absee"
 cfg.adopt_missing_action_schema = cfg.resume_from is None
-cfg.expected_init_transformer_sha256 = os.environ.get(
-    "N0_TRACK32_INIT_TRANSFORMER_SHA256"
+_RECEIPT_VALIDATED_INIT = os.environ.get("N0_TRACK32_INIT_RECEIPT_VALIDATED", "0")
+if _RECEIPT_VALIDATED_INIT not in {"0", "1"}:
+    raise ValueError("N0_TRACK32_INIT_RECEIPT_VALIDATED must be 0 or 1")
+cfg.expected_init_transformer_sha256 = (
+    None
+    if _RECEIPT_VALIDATED_INIT == "1"
+    else os.environ.get("N0_TRACK32_INIT_TRANSFORMER_SHA256")
 )
 cfg.strict_training_resume = True
 cfg.inherit_action_migration_report = False
@@ -237,6 +285,10 @@ cfg.training_lineage = {
     "target_action_schema": cfg.action_schema,
     "tactile_mode": cfg.tactile_mode,
     "tactile_profile": cfg.tactile_profile,
+    "action_loss_profile": cfg.action_loss_profile,
+    "action_loss_scale": cfg.action_loss_scale,
+    "action_channel_loss_weights": cfg.action_channel_loss_weights,
+    "action_horizon_loss_weights": cfg.action_horizon_loss_weights,
 }
 
 # Retain the native N0 MoT architecture; tactile modules exist but are frozen.

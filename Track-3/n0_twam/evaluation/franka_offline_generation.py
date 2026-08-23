@@ -23,6 +23,9 @@ from n0_twam.evaluation.franka_prediction_io import (
     capture_prediction_input,
     require_prediction_unchanged,
 )
+from n0_twam.evaluation.franka_training_aligned_history import (
+    build_training_aligned_video_history,
+)
 from n0_twam.evaluation.sealed_artifact_io import validate_sha256
 from n0_twam.integrations.worldarena.franka_actions import (
     DERIVED_ACTION_SCHEMA,
@@ -97,6 +100,32 @@ def _target_action_rows(
     return np.ascontiguousarray(raw), np.ascontiguousarray(valid)
 
 
+def _current_state_row(
+    sample: Mapping[str, object],
+    *,
+    q01: npt.NDArray[np.float32],
+    q99: npt.NDArray[np.float32],
+) -> npt.NDArray[np.float32]:
+    """Recover the observed EE10 state stored in the cold conditioning frame."""
+
+    actions_value = sample.get("actions")
+    mask_value = sample.get("actions_mask")
+    actions = np.asarray(getattr(actions_value, "numpy", lambda: actions_value)())
+    mask = np.asarray(getattr(mask_value, "numpy", lambda: mask_value)())
+    if actions.shape != (20, 2, 6, 1) or mask.shape != actions.shape:
+        raise ValueError("evaluation sample must contain a two-frame EE20 target")
+    cold = actions[:10, 0, :, 0].T.astype(np.float32, copy=False)
+    cold_valid = mask[:10, 0, :, 0].T
+    if cold_valid.dtype != np.bool_ or not bool(cold_valid.all()):
+        raise ValueError("evaluation cold state must mark every EE10 channel valid")
+    if not np.allclose(cold, cold[:1], rtol=0.0, atol=1e-6):
+        raise ValueError("evaluation cold state must repeat one observed EE10 row")
+    raw = (cold[0] + 1.0) / 2.0 * (q99[:10] - q01[:10] + 1e-6) + q01[:10]
+    if not np.isfinite(raw).all():
+        raise ValueError("evaluation cold state contains non-finite values")
+    return np.ascontiguousarray(raw, dtype=np.float32)
+
+
 def generate_franka_offline_predictions(
     *,
     checkpoint: Path,
@@ -117,6 +146,7 @@ def generate_franka_offline_predictions(
     action_inference_steps: int = 4,
     decode_batch_size: int = 4,
     max_samples: int | None = None,
+    conditioning_source: str = "precomputed_video_latent",
 ) -> dict[str, object]:
     """Run the real cold Direct backend on the frozen validation60 roster."""
 
@@ -138,6 +168,11 @@ def generate_franka_offline_predictions(
         raise ValueError("decode_batch_size must be a positive integer")
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive when supplied")
+    if conditioning_source not in {
+        "precomputed_video_latent",
+        "training_aligned_raw_rgb",
+    }:
+        raise ValueError("unsupported Franka conditioning source")
     destination = Path(output).expanduser()
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"prediction output already exists: {destination}")
@@ -209,6 +244,50 @@ def generate_franka_offline_predictions(
     q01 = np.asarray(config.norm_stat["q01"], dtype=np.float32)
     q99 = np.asarray(config.norm_stat["q99"], dtype=np.float32)
 
+    evaluation_samples = [dataset[index] for index in range(sample_count)]
+    target_ee10_rows: list[npt.NDArray[np.float32]] = []
+    current_poses: list[npt.NDArray[np.float32]] = []
+    current_ee20_rows: list[npt.NDArray[np.float32]] = []
+    action_valid: list[npt.NDArray[np.bool_]] = []
+    target_latents: list[torch.Tensor] = []
+    for sample in evaluation_samples:
+        target_ee10, valid = _target_action_rows(sample, q01=q01, q99=q99)
+        current_ee10 = _current_state_row(sample, q01=q01, q99=q99)
+        latent = sample.get("latents")
+        if not isinstance(latent, torch.Tensor) or latent.ndim != 4:
+            raise ValueError("evaluation sample must contain a four-dimensional latent")
+        target_ee10_rows.append(target_ee10)
+        current_poses.append(ee10_to_end_pose8(current_ee10).reshape(8))
+        current_ee20_rows.append(embed_ee10_in_ee20(current_ee10).reshape(20))
+        action_valid.append(valid)
+        target_latents.append(latent[:, :2].unsqueeze(0).detach().cpu())
+
+    raw_conditioning_latents: list[torch.Tensor] = []
+    if conditioning_source == "training_aligned_raw_rgb":
+        from n0_twam.evaluation.franka_training_aligned_encoder import (
+            TrainingAlignedFrankaVideoEncoder,
+        )
+
+        server_config = TWAM_CONFIGS["track32_franka_server"]
+        encoder = TrainingAlignedFrankaVideoEncoder(
+            base_model=base_path,
+            device=device,
+            camera_keys=tuple(server_config.obs_cam_keys),
+            height=int(server_config.height),
+            width=int(server_config.width),
+            dtype=server_config.param_dtype,
+        )
+        try:
+            for index in range(sample_count):
+                history = build_training_aligned_video_history(
+                    dataset,
+                    sample_index=index,
+                    max_latent_frames=config.max_latent_frames,
+                )
+                raw_conditioning_latents.append(encoder.encode(history.frames))
+        finally:
+            encoder.close()
+
     backend = DirectN0FrankaBackend(
         FrankaPolicyConfig(
             policy_id="n0-twam-franka-offline-eval",
@@ -234,46 +313,38 @@ def generate_franka_offline_predictions(
         )
     )
 
-    evaluation_samples = [dataset[index] for index in range(sample_count)]
-    target_ee10_rows: list[npt.NDArray[np.float32]] = []
-    current_poses: list[npt.NDArray[np.float32]] = []
-    current_ee20_rows: list[npt.NDArray[np.float32]] = []
-    action_valid: list[npt.NDArray[np.bool_]] = []
-    target_latents: list[torch.Tensor] = []
-    for sample in evaluation_samples:
-        target_ee10, valid = _target_action_rows(sample, q01=q01, q99=q99)
-        latent = sample.get("latents")
-        if not isinstance(latent, torch.Tensor) or latent.ndim != 4:
-            raise ValueError("evaluation sample must contain a four-dimensional latent")
-        target_ee10_rows.append(target_ee10)
-        current_poses.append(ee10_to_end_pose8(target_ee10[0]).reshape(8))
-        current_ee20_rows.append(embed_ee10_in_ee20(target_ee10[0]).reshape(20))
-        action_valid.append(valid)
-        target_latents.append(latent[:, :2].unsqueeze(0).detach().cpu())
-
-    target_videos = backend.decode_video_latent_batch(
-        torch.cat(target_latents, dim=0), batch_size=decode_batch_size
-    )
-    target_tiles = [_uint8_tiles(video) for video in target_videos]
-    if any(tiles.shape[1] != 5 for tiles in target_tiles):
-        raise ValueError("target cold video must decode to five RGB frames")
-
     predicted_actions: list[npt.NDArray[np.float32]] = []
     target_actions: list[npt.NDArray[np.float32]] = []
     predicted_latents: list[torch.Tensor] = []
+    conditioning_cosines: list[float] = []
+    conditioning_absolute_errors: list[float] = []
     for index in range(sample_count):
         target_ee10 = target_ee10_rows[index]
         current_pose = current_poses[index]
-        images = {
-            "observation.images.top": target_tiles[index][0, 0],
-            "observation.images.wrist_l": target_tiles[index][1, 0],
-        }
         task = dataset.sample_tasks[index]
         backend.reset(prompt=TASK_PROMPTS[task], seed=seed + index)
+        inference_inputs: dict[str, object]
+        if conditioning_source == "training_aligned_raw_rgb":
+            inference_inputs = {
+                "images": {},
+                "precomputed_video_latent": raw_conditioning_latents[index],
+            }
+        else:
+            inference_inputs = {
+                "images": {},
+                "precomputed_video_latent": target_latents[index][:, :, :1],
+            }
         raw_action, generated_latent = backend.infer_prediction_latent_chunk(
-            images=images,
             current_ee20=current_ee20_rows[index],
+            **inference_inputs,
         )
+        if conditioning_source == "training_aligned_raw_rgb":
+            online = raw_conditioning_latents[index].float().reshape(-1)
+            cached = target_latents[index][:, :, :1].float().reshape(-1)
+            conditioning_cosines.append(
+                float(torch.nn.functional.cosine_similarity(online, cached, dim=0))
+            )
+            conditioning_absolute_errors.append(float(torch.mean(torch.abs(online - cached))))
         if not isinstance(generated_latent, torch.Tensor):
             raise TypeError("Direct backend returned a non-tensor video latent")
         predicted_latents.append(generated_latent.detach().cpu())
@@ -287,6 +358,16 @@ def generate_franka_offline_predictions(
         target_actions.append(
             _decode_actions(target_ee10, quaternion_reference=current_pose[3:7])
         )
+
+    # Raw-prefix conditioning uses the streaming VAE encoder. Decode videos only
+    # after every Policy forward so decoder allocations cannot starve the encoder.
+    backend.release_video_conditioning_cache()
+    target_videos = backend.decode_video_latent_batch(
+        torch.cat(target_latents, dim=0), batch_size=decode_batch_size
+    )
+    target_tiles = [_uint8_tiles(video) for video in target_videos]
+    if any(tiles.shape[1] != 5 for tiles in target_tiles):
+        raise ValueError("target cold video must decode to five RGB frames")
 
     predicted_videos = backend.decode_video_latent_batch(
         torch.cat(predicted_latents, dim=0), batch_size=decode_batch_size
@@ -355,6 +436,18 @@ def generate_franka_offline_predictions(
         "dataset_view_sha256": view.view_sha256,
         "decoder_sha256": decoder_sha256,
         "prediction_mode": "policy_action",
+        "conditioning_source": conditioning_source,
+        "conditioning_latent_cosine_mean": (
+            None if not conditioning_cosines else float(np.mean(conditioning_cosines))
+        ),
+        "conditioning_latent_mean_absolute_error": (
+            None
+            if not conditioning_absolute_errors
+            else float(np.mean(conditioning_absolute_errors))
+        ),
+        "current_state_source": "observation_state_cold_slot",
+        "video_inference_steps": video_inference_steps,
+        "action_inference_steps": action_inference_steps,
         **result,
     }
 

@@ -62,7 +62,7 @@ def build_track32_franka_server_config() -> EasyDict:
     server.empty_cache_each_request = False
     server.show_inference_progress = False
     server.deterministic_episode_seed = True
-    server.cold_seed_mode = "free"
+    server.cold_seed_mode = "current_state"
     server.delta_smooth = False
     server.server_action_output_format = "absolute"
     server.server_return_action_channel_ids = list(range(20))
@@ -81,6 +81,7 @@ def build_track32_franka_server_config() -> EasyDict:
         "action_schema": server.action_schema,
         "tactile_profile": server.tactile_profile,
         "server_tactile_denoise": server.server_tactile_denoise,
+        "cold_seed_mode": server.cold_seed_mode,
         "action_denoise_kv_reuse": server.action_denoise_kv_reuse,
         "action_denoise_kv_contract": server.action_denoise_kv_contract,
         "action_denoise_kv_activation_policy": (

@@ -1276,11 +1276,105 @@ class TWAM_Server(ActionKVServerMixin):
         return input_dict
 
     def _encode_obs(self, obs):
-        images = obs["obs"]
-        if not isinstance(images, list):
-            images = [images]
+        precomputed = obs.get("precomputed_video_latent")
+        training_history = obs.get("training_aligned_video_history")
+        if precomputed is not None and training_history is not None:
+            raise ValueError(
+                "precomputed_video_latent and training_aligned_video_history "
+                "are mutually exclusive"
+            )
+        if precomputed is not None:
+            if not isinstance(precomputed, torch.Tensor):
+                raise TypeError("precomputed_video_latent must be a torch.Tensor")
+            expected_shape = (
+                1,
+                48,
+                1,
+                self.latent_height,
+                self.latent_width,
+            )
+            if tuple(precomputed.shape) != expected_shape:
+                raise ValueError(
+                    "precomputed_video_latent must contain exactly one normalized "
+                    f"training latent frame with shape {expected_shape}"
+                )
+            if not bool(torch.isfinite(precomputed).all()):
+                raise ValueError("precomputed_video_latent contains non-finite values")
+            return precomputed.detach().to(
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return_last_only = training_history is not None
+        if training_history is not None:
+            if not isinstance(training_history, (list, tuple)):
+                raise TypeError("training_aligned_video_history must be a sequence")
+            images = list(training_history)
+            if not images or len(images) % 4 != 1:
+                raise ValueError(
+                    "training_aligned_video_history must contain 4*k+1 frames"
+                )
+            current_images = obs.get("obs")
+            if not isinstance(current_images, list):
+                current_images = [current_images]
+            if len(current_images) != 1:
+                raise ValueError(
+                    "training-aligned cold inference requires one current observation"
+                )
+            current = current_images[0]
+            if not isinstance(current, dict) or not isinstance(images[-1], dict):
+                raise TypeError("video observations must be dictionaries")
+            for key in self.job_config.obs_cam_keys:
+                if key not in current or key not in images[-1]:
+                    raise ValueError(f"missing training-aligned camera {key!r}")
+                if not np.array_equal(np.asarray(current[key]), np.asarray(images[-1][key])):
+                    raise ValueError(
+                        "training-aligned history must end at the current observation"
+                    )
+        else:
+            images = obs["obs"]
+            if not isinstance(images, list):
+                images = [images]
         if len(images) < 1:
             return None
+        if return_last_only:
+            # Latent preparation encodes each camera independently and only then
+            # concatenates camera latents along width. Preserve that contract here:
+            # batching cameras doubles Wan attention memory for a four-frame chunk
+            # and can OOM even though the training encoder fits one camera.
+            camera_latents = []
+            for k in self.job_config.obs_cam_keys:
+                self.streaming_vae.clear_cache()
+                history_video_k = (
+                    torch.from_numpy(np.stack([each[k] for each in images]))
+                    .float()
+                    .permute(3, 0, 1, 2)
+                )
+                history_video_k = F.interpolate(
+                    history_video_k,
+                    size=(self.height, self.width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).unsqueeze(0)
+                videos_chunk = (
+                    history_video_k / 255.0 * 2.0 - 1.0
+                ).to(next(self.streaming_vae.vae.parameters()).device).to(self.dtype)
+                enc_out = self.streaming_vae.encode_chunk(videos_chunk[:, :, :1])
+                for chunk_start in range(1, videos_chunk.shape[2], 4):
+                    enc_out = self.streaming_vae.encode_chunk(
+                        videos_chunk[:, :, chunk_start : chunk_start + 4]
+                    )
+                mu, _ = torch.chunk(enc_out, 2, dim=1)
+                latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
+                latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
+                mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
+                if mu_norm.shape[2] < 1:
+                    raise RuntimeError(
+                        "training-aligned history produced no video latent"
+                    )
+                camera_latents.append(mu_norm[:, :, -1:])
+            self.streaming_vae.clear_cache()
+            return torch.cat(camera_latents, dim=-1).to(self.device)
+
         videos = []
         for k in self.job_config.obs_cam_keys:
             history_video_k = (

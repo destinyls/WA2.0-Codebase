@@ -20,6 +20,7 @@ from n0_twam.checkpointing.strict_checkpoint_snapshot import (
     build_strict_checkpoint_identity,
     capture_strict_checkpoint_snapshot,
 )
+from n0_twam.actions.loss import build_action_loss_profile
 from n0_twam.configs.twam_track32_franka_cfg import twam_track32_franka_cfg
 from n0_twam.integrations.worldarena.franka_actions import (
     DERIVED_ACTION_SCHEMA,
@@ -31,6 +32,8 @@ from n0_twam.integrations.worldarena.franka_artifacts import (
     verify_franka_training_artifacts,
 )
 from n0_twam.integrations.worldarena.franka_manifest import sha256_file
+
+from .completed_init import validate_completed_weights_init
 
 
 def _required_env(name: str) -> str:
@@ -70,6 +73,11 @@ def _require_hash(path: Path, expected: str, *, label: str) -> None:
 
 
 def _require_config_contract(config: object) -> None:
+    loss_profile = build_action_loss_profile(
+        _required_env("N0_TRACK32_ACTION_LOSS_PROFILE"),
+        action_dim=20,
+        action_horizon=6,
+    )
     expected: dict[str, object] = {
         "dataset_adapter": "worldarena_franka_ee10",
         "track32_profile_id": TRACK32_PROFILE_ID,
@@ -98,6 +106,8 @@ def _require_config_contract(config: object) -> None:
         "tactile_diffusion_loss_weight": 0.0,
         "freeze_tactile_parameters": True,
         "strict_training_resume": True,
+        "action_loss_profile": loss_profile.name,
+        "action_loss_scale": loss_profile.scale,
     }
     mismatches = {
         field: (getattr(config, field, None), wanted)
@@ -115,6 +125,31 @@ def _require_config_contract(config: object) -> None:
         "action",
     ):
         raise ValueError("Franka cross-attention experts must exclude tactile")
+    weighted_fields = {
+        "action_channel_loss_weights": list(loss_profile.channel_weights),
+        "action_horizon_loss_weights": list(loss_profile.horizon_weights),
+    }
+    weighted_mismatches = {
+        field: (list(getattr(config, field, [])), wanted)
+        for field, wanted in weighted_fields.items()
+        if list(getattr(config, field, [])) != wanted
+    }
+    lineage = getattr(config, "training_lineage", {})
+    lineage_expected = {
+        "action_loss_profile": loss_profile.name,
+        "action_loss_scale": loss_profile.scale,
+        **weighted_fields,
+    }
+    lineage_mismatches = {
+        field: (lineage.get(field), wanted)
+        for field, wanted in lineage_expected.items()
+        if not isinstance(lineage, dict) or lineage.get(field) != wanted
+    }
+    if weighted_mismatches or lineage_mismatches:
+        raise ValueError(
+            "Franka action loss contract mismatch: "
+            f"config={weighted_mismatches}, lineage={lineage_mismatches}"
+        )
 
 
 def _require_recipe(config: object) -> None:
@@ -327,7 +362,25 @@ def _require_multinode_hsdp_and_ib() -> None:
         _require_hca_binding(entry, uverbs_index=index)
 
 
-def _require_initial_checkpoint(path: Path, expected_sha256: str) -> dict[str, object]:
+def _require_initial_checkpoint(
+    path: Path,
+    expected_sha256: str,
+    expected_completion_sha256: str | None,
+) -> dict[str, object]:
+    if expected_completion_sha256 is not None:
+        completed = validate_completed_weights_init(
+            path,
+            expected_completion_sha256=expected_completion_sha256,
+        )
+        if completed.transformer_identity["sha256"] != expected_sha256:
+            raise ValueError("initial transformer SHA256 differs from the request")
+        return {
+            "mode": "completed_weights_init",
+            "checkpoint_complete_sha256": completed.completion_sha256,
+            "transformer_identity": completed.transformer_identity,
+            "source_step": completed.step,
+            "source_world_size": completed.world_size,
+        }
     transformer = path / "transformer"
     weights = transformer / TRANSFORMER_WEIGHTS_FILENAME
     identity = audit_transformer_checkpoint(weights, expected_action_dim=20)
@@ -412,6 +465,10 @@ def run_preflight() -> dict[str, object]:
         lerobot_root=lerobot_root,
         base_model=base_model,
         run_role=_required_env("N0_TRACK32_RUN_ROLE"),
+        train_view_id=_required_env("N0_TRACK32_TRAIN_VIEW_ID"),
+        normalizer_source_view_id=_required_env(
+            "N0_TRACK32_NORMALIZER_SOURCE_VIEW_ID"
+        ),
     )
     expected_artifacts = {
         "prepare receipt file": (
@@ -434,7 +491,22 @@ def run_preflight() -> dict[str, object]:
             artifacts.normalizer.get("normalizer_sha256"),
             _required_sha("N0_TRACK32_NORMALIZER_SHA256"),
         ),
+        "normalizer source view": (
+            artifacts.normalizer_source_view.view_sha256,
+            _required_sha("N0_TRACK32_NORMALIZER_SOURCE_VIEW_SHA256"),
+        ),
     }
+    full_verification_expected = os.environ.get(
+        "N0_TRACK32_FULL_VERIFICATION_RECEIPT_SHA256"
+    )
+    if artifacts.full_verification_receipt_sha256 is None:
+        if full_verification_expected:
+            raise ValueError("request declares an unexpected full verification receipt")
+    elif artifacts.full_verification_receipt_sha256 != validate_sha256(
+        full_verification_expected,
+        label="N0_TRACK32_FULL_VERIFICATION_RECEIPT_SHA256",
+    ):
+        raise ValueError("full verification receipt differs from the request")
     validation_expected = os.environ.get("N0_TRACK32_VALIDATION_VIEW_SHA256")
     if artifacts.validation_view is None:
         if validation_expected:
@@ -461,6 +533,7 @@ def run_preflight() -> dict[str, object]:
         checkpoint = _require_initial_checkpoint(
             Path(init_raw).expanduser().resolve(strict=True),
             _required_sha("N0_TRACK32_INIT_TRANSFORMER_SHA256"),
+            os.environ.get("N0_TRACK32_INIT_CHECKPOINT_COMPLETE_SHA256"),
         )
     else:
         checkpoint = _require_resume_checkpoint(
@@ -489,7 +562,20 @@ def run_preflight() -> dict[str, object]:
         "tactile_profile": "vision_only",
         "tactile_mode": "disabled",
         "action_route": "end_pose_base8_xyzw_to_ee10_to_ee20_mask_0_9",
+        "action_loss_profile": twam_track32_franka_cfg.action_loss_profile,
+        "action_loss_scale": twam_track32_franka_cfg.action_loss_scale,
+        "action_channel_loss_weights": (
+            twam_track32_franka_cfg.action_channel_loss_weights
+        ),
+        "action_horizon_loss_weights": (
+            twam_track32_franka_cfg.action_horizon_loss_weights
+        ),
         "train_view_sha256": artifacts.train_view.view_sha256,
+        "train_view_id": artifacts.train_view.view_id,
+        "normalizer_source_view_id": artifacts.normalizer_source_view.view_id,
+        "normalizer_source_view_sha256": (
+            artifacts.normalizer_source_view.view_sha256
+        ),
         "validation_view_sha256": (
             None
             if artifacts.validation_view is None
@@ -497,6 +583,9 @@ def run_preflight() -> dict[str, object]:
         ),
         "normalizer_sha256": artifacts.normalizer["normalizer_sha256"],
         "latent_inventory_sha256": artifacts.latent_inventory["inventory_sha256"],
+        "full_verification_receipt_sha256": (
+            artifacts.full_verification_receipt_sha256
+        ),
         "checkpoint": checkpoint,
     }
 
