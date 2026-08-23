@@ -15,8 +15,17 @@ from n0_twam.integrations.worldarena.franka_official_worker import (
     BRIDGE_RELATIVE_PATH,
     WORKER_RELATIVE_PATH,
     _capture_identity,
+    _physical_width_output_to_open_ratio,
     _probe_loaded_bridge,
     _validated_hub_url,
+)
+from n0_twam.integrations.worldarena.franka_live_contract import (
+    FrankaLiveContractConfig,
+    validate_live_observation,
+)
+from n0_twam.integrations.worldarena.franka_live_observation_adapter import (
+    FrankaLiveObservationAdapter,
+    LiveAdaptedPolicy,
 )
 
 
@@ -257,3 +266,288 @@ def test_hub_url_is_https_or_explicit_localhost_only() -> None:
         _validated_hub_url(
             "https://secret@hub.example.invalid/policy", allow_local_http=False
         )
+
+
+@dataclass
+class _Camera:
+    camera_role: str
+    timestamp_ns: int
+    frames: tuple[np.ndarray, ...]
+    frame_history_timestamps_ns: tuple[int, ...]
+
+
+@dataclass
+class _JointState:
+    position_rad: tuple[float, ...] = (0.0,) * 7
+
+
+@dataclass
+class _GripperState:
+    width_m: float | None = 0.04
+    open_ratio: float = 0.5
+
+
+@dataclass
+class _ArmState:
+    arm_id: str = "franka"
+    joint_state: _JointState = field(default_factory=_JointState)
+    ee_pose_base: _Pose = field(default_factory=_Pose)
+    gripper: _GripperState = field(default_factory=_GripperState)
+
+
+@dataclass
+class _RobotState:
+    arms: tuple[_ArmState, ...] = field(default_factory=lambda: (_ArmState(),))
+
+
+@dataclass
+class _ObservationPacket:
+    observation_timestamp_ns: int
+    camera_observations: tuple[_Camera, ...]
+    robot_state: _RobotState = field(default_factory=_RobotState)
+    step_index: int = 0
+
+
+def _live_config() -> FrankaLiveContractConfig:
+    return FrankaLiveContractConfig(
+        conditioning_mode="training_aligned_rgb_replan_v1",
+        target_fps=10,
+        frame_interval_tolerance_ms=15.0,
+        max_state_image_skew_ms=50.0,
+        max_history_frames=5,
+    )
+
+
+def _camera(
+    role: str,
+    timestamps: tuple[int, ...],
+    *,
+    offset: int,
+) -> _Camera:
+    frames = tuple(
+        np.full((4, 6, 3), index + offset, dtype=np.uint8)
+        for index in range(len(timestamps))
+    )
+    return _Camera(
+        camera_role=role,
+        timestamp_ns=timestamps[-1],
+        frames=frames,
+        frame_history_timestamps_ns=timestamps[:-1],
+    )
+
+
+def _decode(camera: object) -> tuple[np.ndarray, ...]:
+    assert isinstance(camera, _Camera)
+    return camera.frames
+
+
+def test_live_adapter_builds_dual_camera_training_aligned_history() -> None:
+    adapter = FrankaLiveObservationAdapter(_live_config())
+    base = 1_000_000_000
+    high_timestamps = tuple(base + index * 100_000_000 for index in range(5))
+    wrist_timestamps = tuple(value + 5_000_000 for value in high_timestamps)
+    packet = _ObservationPacket(
+        observation_timestamp_ns=high_timestamps[-1] + 10_000_000,
+        camera_observations=(
+            _camera("global", high_timestamps, offset=10),
+            _camera("wrist", wrist_timestamps, offset=20),
+        ),
+    )
+
+    result = adapter.augment(
+        packet,
+        {"images": {}, "left_end_pose": np.zeros(7), "joint_qpos": np.zeros(8)},
+        decode_camera_frames=_decode,
+        role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+    )
+
+    history = result["training_aligned_video_history"]
+    assert isinstance(history, tuple) and len(history) == 5
+    assert result["training_aligned_video_timestamps_ns"] == high_timestamps
+    assert result["image_timestamp_ns"] == high_timestamps[-1]
+    assert result["state_timestamp_ns"] == packet.observation_timestamp_ns
+    assert result["observation_sequence_id"] == 0
+    assert result["observation_packet_step_index"] == 0
+    assert result["observation_packet_timestamp_ns"] == (
+        packet.observation_timestamp_ns
+    )
+    assert result["state_timestamp_provenance"] == (
+        "observation_packet.observation_timestamp_ns"
+    )
+    assert result["camera_latest_timestamps_ns"] == {
+        "cam_high": high_timestamps[-1],
+        "cam_left_wrist": wrist_timestamps[-1],
+    }
+    assert result["history_coverage_start_ns"] == high_timestamps[0]
+    assert result["history_coverage_end_ns"] == high_timestamps[-1]
+    assert result["history_coverage_duration_ms"] == pytest.approx(400.0)
+    assert result["active_arm_id"] == "franka"
+    assert result["gripper_observation_unit"] == "width_m"
+    assert result["joint_qpos"].shape == (8,)
+    assert result["joint_qpos"][-1] == pytest.approx(0.04)
+    assert np.array_equal(result["images"]["cam_high"], history[-1]["cam_high"])
+    assert np.array_equal(
+        result["images"]["cam_left_wrist"], history[-1]["cam_left_wrist"]
+    )
+    assert result["training_aligned_video_source_timestamps_ns"] == {
+        "cam_high": high_timestamps,
+        "cam_left_wrist": wrist_timestamps,
+    }
+    validated = validate_live_observation(
+        result,
+        config=_live_config(),
+        history=history,
+        current_state=np.zeros(8, dtype=np.float32),
+        previous_sequence_id=None,
+        previous_image_timestamp_ns=None,
+    )
+    assert validated.report["status"] == "verified"
+
+
+def test_live_adapter_uses_one_frame_only_during_causal_warmup() -> None:
+    adapter = FrankaLiveObservationAdapter(_live_config())
+    timestamp = 2_000_000_000
+    packet = _ObservationPacket(
+        observation_timestamp_ns=timestamp + 1_000_000,
+        camera_observations=(
+            _camera("global", (timestamp,), offset=10),
+            _camera("wrist", (timestamp,), offset=20),
+        ),
+    )
+
+    result = adapter.augment(
+        packet,
+        {"images": {}},
+        decode_camera_frames=_decode,
+        role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+    )
+
+    assert len(result["training_aligned_video_history"]) == 1
+    assert result["training_aligned_video_timestamps_ns"] == (timestamp,)
+
+
+def test_live_adapter_grows_history_on_four_frame_causal_boundaries() -> None:
+    config = FrankaLiveContractConfig(
+        conditioning_mode="training_aligned_rgb_replan_v1",
+        target_fps=10,
+        frame_interval_tolerance_ms=15.0,
+        max_state_image_skew_ms=50.0,
+        max_history_frames=4097,
+    )
+    adapter = FrankaLiveObservationAdapter(config)
+    base = 2_500_000_000
+    timestamps = tuple(base + index * 100_000_000 for index in range(9))
+    packet = _ObservationPacket(
+        observation_timestamp_ns=timestamps[-1] + 1_000_000,
+        camera_observations=(
+            _camera("global", timestamps, offset=10),
+            _camera("wrist", timestamps, offset=20),
+        ),
+    )
+
+    result = adapter.augment(
+        packet,
+        {"images": {}},
+        decode_camera_frames=_decode,
+        role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+    )
+
+    assert len(result["training_aligned_video_history"]) == 9
+    assert result["training_aligned_video_timestamps_ns"] == timestamps
+
+
+def test_live_action_converts_width_m_to_open_ratio_without_mutation() -> None:
+    model_actions = np.asarray(((0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.04),))
+    output = {
+        "actions": model_actions,
+        "policy_metadata": {"action_format": "end_pose_base"},
+    }
+
+    adapted = _physical_width_output_to_open_ratio(
+        output,
+        gripper_max_width_m=0.08,
+    )
+
+    assert model_actions[0, 7] == pytest.approx(0.04)
+    assert adapted["actions"][0, 7] == pytest.approx(0.5)
+    assert adapted["policy_metadata"]["model_gripper_unit"] == "width_m"
+    assert adapted["policy_metadata"]["wire_gripper_unit"] == "open_ratio"
+
+
+def test_live_adapter_calibrates_open_ratio_when_width_is_absent() -> None:
+    adapter = FrankaLiveObservationAdapter(_live_config())
+    timestamp = 2_900_000_000
+    packet = _ObservationPacket(
+        observation_timestamp_ns=timestamp + 1_000_000,
+        camera_observations=(
+            _camera("global", (timestamp,), offset=10),
+            _camera("wrist", (timestamp,), offset=20),
+        ),
+        robot_state=_RobotState(
+            arms=(_ArmState(gripper=_GripperState(width_m=None, open_ratio=0.8)),)
+        ),
+    )
+
+    result = adapter.augment(
+        packet,
+        {"images": {}},
+        decode_camera_frames=_decode,
+        role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+    )
+
+    assert result["joint_qpos"][-1] == pytest.approx(0.064)
+    assert result["gripper_observation_source"] == "open_ratio_calibrated"
+
+
+def test_live_adapter_rejects_missing_10hz_history_after_coverage() -> None:
+    adapter = FrankaLiveObservationAdapter(_live_config())
+    first = 3_000_000_000
+    packet = _ObservationPacket(
+        observation_timestamp_ns=first + 1_000_000,
+        camera_observations=(
+            _camera("global", (first,), offset=10),
+            _camera("wrist", (first,), offset=20),
+        ),
+    )
+    adapter.augment(
+        packet,
+        {"images": {}},
+        decode_camera_frames=_decode,
+        role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+    )
+    second = first + 500_000_000
+    packet = _ObservationPacket(
+        observation_timestamp_ns=second + 1_000_000,
+        camera_observations=(
+            _camera("global", (second,), offset=30),
+            _camera("wrist", (second,), offset=40),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="required 10 Hz causal grid"):
+        adapter.augment(
+            packet,
+            {"images": {}},
+            decode_camera_frames=_decode,
+            role_to_model_key={"global": "cam_high", "wrist": "cam_left_wrist"},
+        )
+
+
+def test_live_adapter_and_policy_reset_together() -> None:
+    class _Policy:
+        def __init__(self) -> None:
+            self.reset_calls: list[dict[str, object] | None] = []
+
+        def reset(self, reset_info: dict[str, object] | None = None) -> None:
+            self.reset_calls.append(reset_info)
+
+        def infer(self, new_obs: dict[str, object]) -> dict[str, object]:
+            return new_obs
+
+    core = _Policy()
+    adapter = FrankaLiveObservationAdapter(_live_config())
+    wrapped = LiveAdaptedPolicy(core, adapter)
+
+    wrapped.reset({"episode_id": "next"})
+
+    assert core.reset_calls == [{"episode_id": "next"}]

@@ -124,10 +124,10 @@ def _artifact_identity(request: Track32TrainRequest) -> dict[str, object]:
         "profile": TRACK32_PROFILE_ID,
         "run_role": request.train.run_role,
         "source_records_sha256": OFFICIAL_RECORDS_SHA256,
-        "train_view_id": (
-            "franka_dev_train540_v1"
-            if request.train.run_role == "development"
-            else "franka_final_refit600_v1"
+        "train_view_id": request.artifacts.train_view_id,
+        "normalizer_source_view_id": request.artifacts.normalizer_source_view_id,
+        "normalizer_source_view_sha256": (
+            request.artifacts.normalizer_source_view_sha256
         ),
         "validation_view_id": validation_id,
         "validation_view_sha256": request.artifacts.validation_view_sha256,
@@ -135,6 +135,9 @@ def _artifact_identity(request: Track32TrainRequest) -> dict[str, object]:
         "conversion_report_file_sha256": (request.artifacts.conversion_report_sha256),
         "latent_inventory_file_sha256": (
             request.artifacts.latent_inventory_file_sha256
+        ),
+        "full_verification_receipt_sha256": (
+            request.artifacts.full_verification_receipt_sha256
         ),
         "train_view_sha256": request.artifacts.train_view_sha256,
         "normalizer_sha256": request.artifacts.normalizer_sha256,
@@ -173,6 +176,9 @@ def build_launch_plan(request: Track32TrainRequest) -> dict[str, object]:
         },
         "empty_embedding_sha256": paths.empty_embedding_sha256,
         "init_transformer_sha256": paths.init_transformer_sha256,
+        "init_checkpoint_complete_sha256": (
+            paths.init_checkpoint_complete_sha256
+        ),
         "resume_checkpoint_identity_sha256": (paths.resume_checkpoint_identity_sha256),
         "artifact_identity": _artifact_identity(request),
         "preflight_command": list(build_preflight_command()),
@@ -187,6 +193,7 @@ def build_launch_plan(request: Track32TrainRequest) -> dict[str, object]:
             "gradient_accumulation_steps": recipe.gradient_accumulation_steps,
             "max_latent_frames": recipe.max_latent_frames,
             "seed": recipe.seed,
+            "action_loss_profile": recipe.action_loss_profile,
         },
         "model_contract": {
             "wire_action_schema": FRANKA_ACTION_SCHEMA,
@@ -244,12 +251,20 @@ def build_training_environment(
             "N0_TRACK32_MAX_LATENT_FRAMES": str(recipe.max_latent_frames),
             "N0_TRACK32_LOAD_WORKER": "0",
             "N0_TRACK32_SEED": str(recipe.seed),
+            "N0_TRACK32_ACTION_LOSS_PROFILE": recipe.action_loss_profile,
             "N0_TRACK32_PREPARE_RECEIPT_SHA256": (artifacts.prepare_receipt_sha256),
             "N0_TRACK32_CONVERSION_REPORT_SHA256": (artifacts.conversion_report_sha256),
             "N0_TRACK32_LATENT_INVENTORY_FILE_SHA256": (
                 artifacts.latent_inventory_file_sha256
             ),
             "N0_TRACK32_TRAIN_VIEW_SHA256": artifacts.train_view_sha256,
+            "N0_TRACK32_TRAIN_VIEW_ID": artifacts.train_view_id,
+            "N0_TRACK32_NORMALIZER_SOURCE_VIEW_ID": (
+                artifacts.normalizer_source_view_id
+            ),
+            "N0_TRACK32_NORMALIZER_SOURCE_VIEW_SHA256": (
+                artifacts.normalizer_source_view_sha256
+            ),
             "N0_TRACK32_NORMALIZER_SHA256": artifacts.normalizer_sha256,
             **provenance.environment(),
         }
@@ -290,11 +305,20 @@ def build_training_environment(
         environment["N0_TRACK32_VALIDATION_VIEW_SHA256"] = (
             artifacts.validation_view_sha256
         )
+    if artifacts.full_verification_receipt_sha256 is not None:
+        environment["N0_TRACK32_FULL_VERIFICATION_RECEIPT_SHA256"] = (
+            artifacts.full_verification_receipt_sha256
+        )
     if paths.init_from is not None:
         environment["N0_TRACK32_INIT_FROM"] = str(paths.init_from)
         environment["N0_TRACK32_INIT_TRANSFORMER_SHA256"] = str(
             paths.init_transformer_sha256
         )
+        if paths.init_checkpoint_complete_sha256 is not None:
+            environment["N0_TRACK32_INIT_CHECKPOINT_COMPLETE_SHA256"] = (
+                paths.init_checkpoint_complete_sha256
+            )
+            environment["N0_TRACK32_INIT_RECEIPT_VALIDATED"] = "1"
     if paths.resume_from is not None:
         environment["N0_TRACK32_RESUME_FROM"] = str(paths.resume_from)
         environment["N0_TRACK32_RESUME_CHECKPOINT_IDENTITY_SHA256"] = str(

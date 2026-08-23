@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -22,6 +22,10 @@ from .franka_policy import (
     FRANKA_CONTROL_ARM,
     Policy,
     load_franka_policy_config,
+)
+from .franka_live_observation_adapter import (
+    FrankaLiveObservationAdapter,
+    LiveAdaptedPolicy,
 )
 
 PINNED_WORLD_ARENA_REVISION = "6f5a981b34232fe77812b818a6ad7a4e6b8728ac"
@@ -242,6 +246,7 @@ print(json.dumps(_probe_loaded_bridge(bridge, schema), sort_keys=True))
         env={
             "LANG": "C",
             "LC_ALL": "C",
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",
@@ -320,6 +325,98 @@ def _load_official_worker(root: Path) -> Any:
     return module.run_policy_hub_worker
 
 
+def _install_live_observation_adapter(
+    root: Path,
+    adapter: FrankaLiveObservationAdapter,
+    *,
+    gripper_max_width_m: float,
+) -> Callable[[], None]:
+    """Wrap verified observation/action bridges without changing official files."""
+
+    bridge = importlib.import_module(
+        "real_world_benchmark.worldarena.bridges.legacy_policy"
+    )
+    package_root = (root / "real_world_benchmark").resolve(strict=True)
+    module_file = getattr(bridge, "__file__", None)
+    if not isinstance(module_file, str):
+        raise RuntimeError("WorldArena live adapter dependency has no source file")
+    if package_root not in Path(module_file).resolve(strict=True).parents:
+        raise RuntimeError(
+            f"WorldArena live adapter import was shadowed: {module_file}"
+        )
+    original_observation = getattr(bridge, "observation_packet_to_new_obs")
+    original_action = getattr(bridge, "infer_output_to_action_packet")
+    decode_camera_frames = getattr(bridge, "stack_camera_frames")
+    role_to_model_key = {
+        str(getattr(bridge, "CAMERA_ROLE_GLOBAL")): "cam_high",
+        str(getattr(bridge, "CAMERA_ROLE_LEFT_WRIST")): "cam_left_wrist",
+        str(getattr(bridge, "CAMERA_ROLE_RIGHT_WRIST")): "cam_left_wrist",
+    }
+
+    def adapted(
+        packet: object, *args: Any, **kwargs: Any
+    ) -> dict[str, object]:
+        new_obs = original_observation(packet, *args, **kwargs)
+        return adapter.augment(
+            packet,
+            new_obs,
+            decode_camera_frames=decode_camera_frames,
+            role_to_model_key=role_to_model_key,
+        )
+
+    def adapted_action(
+        output: Mapping[str, object], *args: Any, **kwargs: Any
+    ) -> object:
+        adapted_output = _physical_width_output_to_open_ratio(
+            output,
+            gripper_max_width_m=gripper_max_width_m,
+        )
+        return original_action(adapted_output, *args, **kwargs)
+
+    bridge.observation_packet_to_new_obs = adapted
+    bridge.infer_output_to_action_packet = adapted_action
+
+    def restore() -> None:
+        bridge.observation_packet_to_new_obs = original_observation
+        bridge.infer_output_to_action_packet = original_action
+
+    return restore
+
+
+def _physical_width_output_to_open_ratio(
+    output: Mapping[str, object],
+    *,
+    gripper_max_width_m: float,
+) -> dict[str, object]:
+    """Convert model physical width to the canonical wire open-ratio unit."""
+
+    if not np.isfinite(gripper_max_width_m) or gripper_max_width_m <= 0.0:
+        raise ValueError("gripper_max_width_m must be positive and finite")
+    actions = np.asarray(output.get("actions"), dtype=np.float32)
+    if actions.ndim not in (1, 2) or actions.shape[-1] != 8:
+        raise ValueError("Franka live action must have shape (8,) or (N, 8)")
+    if not np.isfinite(actions).all():
+        raise ValueError("Franka live action must be finite")
+    widths = actions[..., 7]
+    if np.any(widths < 0.0) or np.any(widths > gripper_max_width_m):
+        raise ValueError("Franka live gripper width is outside calibrated limits")
+    wire_actions = actions.copy()
+    wire_actions[..., 7] = widths / gripper_max_width_m
+    adapted_output = dict(output)
+    adapted_output["actions"] = wire_actions
+    metadata_raw = adapted_output.get("policy_metadata")
+    metadata = dict(metadata_raw) if isinstance(metadata_raw, Mapping) else {}
+    metadata.update(
+        {
+            "model_gripper_unit": "width_m",
+            "wire_gripper_unit": "open_ratio",
+            "gripper_max_width_m": gripper_max_width_m,
+        }
+    )
+    adapted_output["policy_metadata"] = metadata
+    return adapted_output
+
+
 def run_official_franka_worker(
     *,
     worldarena_root: Path,
@@ -359,6 +456,45 @@ def run_official_franka_worker(
         "hub_url": endpoint,
         "hub_token_present": bool(token),
         "connects_to_hub": not dry_run,
+        "live_observation_adapter": {
+            "enabled": policy_config.live_contract is not None,
+            "source": "canonical_observation_packet",
+            "camera_history": "dual_camera_10hz_4k_plus_1",
+            "state_timestamp": "observation_packet.observation_timestamp_ns",
+            "continuous_capture_required_during_action_execution": (
+                policy_config.live_contract is not None
+            ),
+            "execution_mode": (
+                "future6_then_fresh_replan"
+                if policy_config.live_contract is not None
+                else "legacy"
+            ),
+            "requested_action_hz": (
+                policy_config.live_contract.action_hz
+                if policy_config.live_contract is not None
+                else None
+            ),
+            "actions_per_replan": (
+                policy_config.live_contract.actions_per_replan
+                if policy_config.live_contract is not None
+                else None
+            ),
+            "future_prediction_range": (
+                [
+                    policy_config.live_contract.future_start_index,
+                    policy_config.live_contract.future_start_index
+                    + policy_config.live_contract.actions_per_replan,
+                ]
+                if policy_config.live_contract is not None
+                else None
+            ),
+            "requires_fresh_observation_after_chunk": (
+                policy_config.live_contract.require_fresh_observation_after_chunk
+                if policy_config.live_contract is not None
+                else False
+            ),
+            "private_executor_cadence_verified": False,
+        },
     }
     if dry_run:
         return report
@@ -370,15 +506,31 @@ def run_official_franka_worker(
         raise RuntimeError("WorldArena audit omitted its source root")
     root = Path(root_value)
     worker = _load_official_worker(root)
-    policy = Policy(str(config))
-    worker(
-        policy,
-        hub_url=endpoint,
-        worker_key=worker_key,
-        policy_source="n0_twam.integrations.worldarena.franka_policy.Policy",
-        legacy_bridge=True,
-        token=token,
-    )
+    policy: object = Policy(str(config))
+    restore_bridge = None
+    if policy_config.live_contract is not None:
+        live_adapter = FrankaLiveObservationAdapter(
+            policy_config.live_contract,
+            gripper_max_width_m=policy_config.safety.gripper_max,
+        )
+        restore_bridge = _install_live_observation_adapter(
+            root,
+            live_adapter,
+            gripper_max_width_m=policy_config.safety.gripper_max,
+        )
+        policy = LiveAdaptedPolicy(policy, live_adapter)
+    try:
+        worker(
+            policy,
+            hub_url=endpoint,
+            worker_key=worker_key,
+            policy_source="n0_twam.integrations.worldarena.franka_policy.Policy",
+            legacy_bridge=True,
+            token=token,
+        )
+    finally:
+        if restore_bridge is not None:
+            restore_bridge()
     report["status"] = "stopped"
     report["connects_to_hub"] = False
     return report

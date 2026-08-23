@@ -28,7 +28,18 @@ def _payload() -> dict[str, object]:
     assert isinstance(paths, dict) and isinstance(artifacts, dict)
     paths["empty_embedding_sha256"] = "a" * 64
     paths["init_transformer_sha256"] = "b" * 64
-    for digest, field in zip(("c", "d", "e", "f", "0", "1"), artifacts):
+    for digest, field in zip(
+        ("c", "d", "e", "f", "0", "1", "2"),
+        (
+            "prepare_receipt_sha256",
+            "conversion_report_sha256",
+            "latent_inventory_file_sha256",
+            "train_view_sha256",
+            "validation_view_sha256",
+            "normalizer_source_view_sha256",
+            "normalizer_sha256",
+        ),
+    ):
         artifacts[field] = digest * 64
     return payload
 
@@ -69,6 +80,7 @@ def test_track32_request_and_plan_pin_franka_contract(tmp_path: Path) -> None:
     assert request.runtime.devices == tuple(range(8))
     assert request.runtime.accelerator_profile == "portable"
     assert plan["world_size"] == 8
+    assert plan["recipe"]["action_loss_profile"] == "legacy_v1"
     assert plan["model_contract"] == {
         "wire_action_schema": "franka_end_pose_base_xyzw8_v2",
         "derived_action_schema": "franka_ee10_rot6d_columns_from_xyzw_v2",
@@ -98,6 +110,7 @@ def test_track32_environment_is_clean_and_profile_bound(tmp_path: Path) -> None:
             "GLOO_SOCKET_IFNAME": "eno1",
             "NCCL_SOCKET_IFNAME": "eno1",
             "N0_ROGUE": "1",
+            "N0_TRACK32_ACTION_LOSS_PROFILE": "franka_trajectory_fit_v1",
         },
     )
 
@@ -105,6 +118,12 @@ def test_track32_environment_is_clean_and_profile_bound(tmp_path: Path) -> None:
     assert environment["PYTHONPATH"] == str(package_import_root())
     assert environment["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
     assert environment["N0_TRACK32_ACCELERATOR_PROFILE"] == "portable"
+    assert environment["N0_TRACK32_ACTION_LOSS_PROFILE"] == "legacy_v1"
+    assert environment["N0_TRACK32_TRAIN_VIEW_ID"] == "franka_dev_train540_v1"
+    assert (
+        environment["N0_TRACK32_NORMALIZER_SOURCE_VIEW_ID"]
+        == "franka_dev_train540_v1"
+    )
     assert environment["N0_MOT_ACTIVATION_CHECKPOINTING"] == "1"
     assert environment["N0_FLEX_ATTENTION_BACKEND"] == "grouped_sdpa"
     assert "PYTHONHOME" not in environment
@@ -112,6 +131,28 @@ def test_track32_environment_is_clean_and_profile_bound(tmp_path: Path) -> None:
     assert "GLOO_SOCKET_IFNAME" not in environment
     assert "NCCL_SOCKET_IFNAME" not in environment
     assert "N0_ROGUE" not in environment
+
+
+def test_completed_weights_init_maps_receipt_without_rank_local_rehash(
+    tmp_path: Path,
+) -> None:
+    payload = _payload()
+    paths = payload["paths"]
+    artifacts = payload["artifacts"]
+    assert isinstance(paths, dict) and isinstance(artifacts, dict)
+    paths["init_checkpoint_complete_sha256"] = "4" * 64
+    artifacts["full_verification_receipt_sha256"] = "5" * 64
+    request = load_track32_train_request(_write_request(tmp_path, payload))
+
+    environment = build_training_environment(
+        request,
+        _provenance(tmp_path),
+        environ={"PATH": "/usr/bin"},
+    )
+
+    assert environment["N0_TRACK32_INIT_CHECKPOINT_COMPLETE_SHA256"] == "4" * 64
+    assert environment["N0_TRACK32_INIT_RECEIPT_VALIDATED"] == "1"
+    assert environment["N0_TRACK32_FULL_VERIFICATION_RECEIPT_SHA256"] == "5" * 64
 
 
 def test_hcu_profile_binds_a_verified_collective_interface(
@@ -245,4 +286,33 @@ def test_track32_request_rejects_unknown_profile_and_output_overlap(
     assert isinstance(paths, dict)
     paths["output_root"] = "./artifacts/franka/output"
     with pytest.raises(ValueError, match="disjoint"):
+        load_track32_train_request(_write_request(tmp_path, payload))
+
+
+def test_track32_request_binds_trajectory_action_loss_profile(tmp_path: Path) -> None:
+    payload = _payload()
+    train = payload["train"]
+    assert isinstance(train, dict)
+    train["action_loss_profile"] = "franka_trajectory_fit_v1"
+    request = load_track32_train_request(_write_request(tmp_path, payload))
+
+    environment = build_training_environment(
+        request,
+        _provenance(tmp_path),
+        environ={"N0_TRACK32_ACTION_LOSS_PROFILE": "legacy_v1"},
+    )
+
+    assert request.train.action_loss_profile == "franka_trajectory_fit_v1"
+    assert environment["N0_TRACK32_ACTION_LOSS_PROFILE"] == (
+        "franka_trajectory_fit_v1"
+    )
+
+
+def test_track32_request_rejects_unknown_action_loss_profile(tmp_path: Path) -> None:
+    payload = _payload()
+    train = payload["train"]
+    assert isinstance(train, dict)
+    train["action_loss_profile"] = "ambient_override"
+
+    with pytest.raises(ValueError, match="train.action_loss_profile"):
         load_track32_train_request(_write_request(tmp_path, payload))

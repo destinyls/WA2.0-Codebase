@@ -71,6 +71,7 @@ from n0_twam.actions import (
     build_action_codec_from_config,
     resolve_action_codec_name,
 )
+from n0_twam.actions.loss import weighted_action_flow_mse
 from n0_twam.checkpointing.identity import (
     TRANSFORMER_WEIGHTS_FILENAME,
     audit_transformer_checkpoint,
@@ -2345,29 +2346,18 @@ class Trainer:
             input_dict["action_dict"]["timesteps"].flatten()
         ).reshape(Bn, Fn)
 
-        # Per-element MSE:
-        #   action_loss: [B, C_action, F_action, N_action, 1]
-        action_loss = F.mse_loss(
-            action_pred.float(), action_target.float().detach(), reduction="none"
+        return weighted_action_flow_mse(
+            action_pred,
+            action_target,
+            action_mask,
+            action_loss_weight,
+            channel_weights=getattr(
+                self.config, "action_channel_loss_weights", None
+            ),
+            horizon_weights=getattr(
+                self.config, "action_horizon_loss_weights", None
+            ),
         )
-        action_loss = action_loss * action_loss_weight[:, None, :, None, None]
-        action_loss = action_loss * action_mask
-        # Move frame next to batch and flatten action channels/horizon:
-        #   [B, C, F, N, 1] -> [B, F, N, 1, C] -> [B*F, N*C]
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)
-        action_mask = action_mask.permute(0, 2, 3, 4, 1)
-        action_loss = action_loss.flatten(0, 1).flatten(1)
-        action_mask = action_mask.flatten(0, 1).flatten(1)
-        # Normalize by valid action elements per frame. Frames with no valid
-        # action tokens, such as pi05's first condition frame, do not contribute.
-        action_loss_per_frame = action_loss.sum(dim=1)
-        action_mask_per_frame = action_mask.sum(dim=1)
-        valid_frame = action_mask_per_frame > 0
-        if not valid_frame.any():
-            return action_loss_per_frame.sum() * 0.0
-        return (
-            action_loss_per_frame[valid_frame] / action_mask_per_frame[valid_frame]
-        ).mean()
 
     def compute_loss(self, input_dict, pred):
         # Symdiff: pred is 3-tuple (video_pred, action_pred, tactile_pred).
@@ -2444,7 +2434,10 @@ class Trainer:
                 tactile_loss = (tactile_pred.sum() * 0.0).float()
 
         weight = float(getattr(self.config, "tactile_diffusion_loss_weight", 1.0))
-        total_loss = latent_loss + action_loss + weight * tactile_loss
+        action_scale = float(getattr(self.config, "action_loss_scale", 1.0))
+        if not 0.0 < action_scale < float("inf"):
+            raise ValueError("action_loss_scale must be positive and finite")
+        total_loss = latent_loss + action_scale * action_loss + weight * tactile_loss
         # Divide before backward so accumulated micro-batches produce the same
         # gradient scale as a single large batch.
         scale = self.gradient_accumulation_steps

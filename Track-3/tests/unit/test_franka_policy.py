@@ -22,16 +22,30 @@ class _Backend:
         self.output = output
         self.reset_calls: list[tuple[str, int]] = []
         self.committed: list[dict[str, object]] = []
+        self.conditioning: list[dict[str, object]] = []
 
     def reset(self, *, prompt: str, seed: int) -> None:
         self.reset_calls.append((prompt, seed))
 
-    def infer(self, *, images, current_ee20) -> np.ndarray:
+    def infer(
+        self,
+        *,
+        images,
+        current_ee20,
+        precomputed_video_latent=None,
+        training_aligned_video_history=None,
+    ) -> np.ndarray:
         assert set(images) == {
             "observation.images.top",
             "observation.images.wrist_l",
         }
         assert current_ee20.shape == (20,)
+        self.conditioning.append(
+            {
+                "latent": precomputed_video_latent,
+                "history": training_aligned_video_history,
+            }
+        )
         return self.output.copy()
 
     def commit_executed_chunk(
@@ -54,9 +68,21 @@ class _OrderedBackend(_Backend):
         super().__init__(output)
         self.events: list[str] = []
 
-    def infer(self, *, images, current_ee20) -> np.ndarray:
+    def infer(
+        self,
+        *,
+        images,
+        current_ee20,
+        precomputed_video_latent=None,
+        training_aligned_video_history=None,
+    ) -> np.ndarray:
         self.events.append("infer")
-        return super().infer(images=images, current_ee20=current_ee20)
+        return super().infer(
+            images=images,
+            current_ee20=current_ee20,
+            precomputed_video_latent=precomputed_video_latent,
+            training_aligned_video_history=training_aligned_video_history,
+        )
 
     def commit_executed_chunk(
         self, *, actions_ee20_cfh, image_history, action_anchor_ee20
@@ -100,6 +126,32 @@ def _config(tmp_path: Path) -> Path:
     return path
 
 
+def _strict_config(tmp_path: Path, *, external_chunk_actions: int = 1) -> Path:
+    path = _config(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 4 if external_chunk_actions == 6 else 3
+    payload["external_chunk_actions"] = external_chunk_actions
+    payload["live_contract"] = {
+        "conditioning_mode": "training_aligned_rgb_replan_v1",
+        "target_fps": 10,
+        "frame_interval_tolerance_ms": 15.0,
+        "max_state_image_skew_ms": 50.0,
+        "max_history_frames": 5,
+    }
+    if payload["schema_version"] == 4:
+        payload["live_contract"].update(
+            {
+                "action_hz": 15,
+                "actions_per_replan": 6,
+                "future_start_index": 6,
+                "require_dual_camera_history": True,
+                "require_fresh_observation_after_chunk": True,
+            }
+        )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _backend_output() -> np.ndarray:
     poses = np.repeat(
         np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5]], np.float32),
@@ -132,6 +184,220 @@ def _observation(frame_value: int = 0) -> dict[str, object]:
         "left_end_pose": np.asarray((0, 0, 0, 0, 0, 0, 1), np.float32),
         "joint_qpos": np.asarray((0, 0, 0, 0, 0, 0, 0, 0.5), np.float32),
     }
+
+
+def _video_history(length: int) -> list[dict[str, np.ndarray]]:
+    return [
+        {
+            "cam_high": np.full((8, 8, 3), index, dtype=np.uint8),
+            "cam_left_wrist": np.full((8, 8, 3), index + 1, dtype=np.uint8),
+        }
+        for index in range(length)
+    ]
+
+
+def _strict_observation(
+    *, sequence_id: int, first_frame: int, state_skew_ms: int = 20
+) -> dict[str, object]:
+    history = [
+        {
+            "cam_high": np.full((8, 8, 3), first_frame + index, np.uint8),
+            "cam_left_wrist": np.full(
+                (8, 8, 3), first_frame + index + 1, np.uint8
+            ),
+        }
+        for index in range(5)
+    ]
+    timestamps = [
+        (first_frame + index) * 100_000_000 for index in range(len(history))
+    ]
+    observation = _observation(first_frame + 4)
+    observation.update(
+        {
+            "training_aligned_video_history": history,
+            "training_aligned_video_timestamps_ns": timestamps,
+            "image_timestamp_ns": timestamps[-1],
+            "state_timestamp_ns": timestamps[-1] + state_skew_ms * 1_000_000,
+            "observation_sequence_id": sequence_id,
+        }
+    )
+    return observation
+
+
+def test_strict_live_policy_replans_once_and_discards_unexecuted_actions(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_strict_config(tmp_path)), backend=backend)
+    policy.reset({"prompt": "clear the table"})
+
+    first = policy.infer(_strict_observation(sequence_id=0, first_frame=0))
+    second = policy.infer(_strict_observation(sequence_id=1, first_frame=1))
+
+    assert first["actions"][0, 0] == pytest.approx(0.06)
+    assert second["actions"][0, 0] == pytest.approx(0.06)
+    assert backend.reset_calls == [("clear the table", 11), ("clear the table", 12)]
+    assert len(backend.conditioning) == 2
+    assert backend.committed == []
+    for result in (first, second):
+        assert result["policy_timing"]["kind"] == "strict_live_generation"
+        assert result["policy_timing"]["generated"] is True
+        assert result["policy_timing"]["grounded"] is False
+        assert result["policy_timing"]["queue_depth_after"] == 0
+        metadata = result["policy_metadata"]
+        assert metadata["execution_mode"] == "replan_each_observation"
+        assert metadata["selected_prediction_index"] == 6
+        assert metadata["discarded_prediction_count"] == 11
+        assert metadata["live_contract"]["status"] == "verified"
+
+
+def test_strict_live_policy_returns_future_six_then_replans_from_new_observation(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(
+        str(_strict_config(tmp_path, external_chunk_actions=6)), backend=backend
+    )
+    policy.reset({"prompt": "clear the table"})
+
+    first = policy.infer(_strict_observation(sequence_id=0, first_frame=0))
+    second = policy.infer(_strict_observation(sequence_id=1, first_frame=1))
+    third = policy.infer(_strict_observation(sequence_id=2, first_frame=2))
+
+    assert first["actions"].shape == (6, 8)
+    assert second["actions"].shape == (6, 8)
+    assert third["actions"].shape == (6, 8)
+    assert first["actions"][:, 0] == pytest.approx(np.linspace(0.06, 0.11, 6))
+    assert second["actions"][:, 0] == pytest.approx(np.linspace(0.06, 0.11, 6))
+    assert third["actions"][:, 0] == pytest.approx(np.linspace(0.06, 0.11, 6))
+    assert backend.reset_calls == [
+        ("clear the table", 11),
+        ("clear the table", 12),
+        ("clear the table", 13),
+    ]
+    assert len(backend.conditioning) == 3
+    assert backend.committed == []
+
+    for result in (first, second, third):
+        assert result["policy_timing"]["generated"] is True
+        assert result["policy_timing"]["kind"] == "strict_live_generation"
+        assert result["policy_timing"]["queue_depth_after"] == 0
+        metadata = result["policy_metadata"]
+        assert metadata["execution_mode"] == "future6_then_fresh_replan"
+        assert metadata["chunk_size"] == 6
+        assert metadata["selected_prediction_index"] == 6
+        assert metadata["selected_prediction_end"] == 12
+        assert metadata["selected_prediction_range"] == [6, 12]
+        assert metadata["discarded_prediction_count"] == 6
+        assert metadata["discarded_future_prediction_count"] == 0
+        assert metadata["conditioning_slots_skipped"] == 6
+        assert metadata["returned_future_actions"] == 6
+        assert metadata["requested_action_hz"] == 15
+        assert metadata["expected_execution_duration_ms"] == pytest.approx(400.0)
+        assert metadata["requires_fresh_observation_after_chunk"] is True
+        assert metadata["live_contract"]["status"] == "verified"
+
+
+def test_strict_live_policy_fails_closed_on_missing_or_stale_timing(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_strict_config(tmp_path)), backend=backend)
+
+    missing = _observation(4)
+    missing["training_aligned_video_history"] = _video_history(5)
+    with pytest.raises(ValueError, match="timestamps_ns length mismatch"):
+        policy.infer(missing)
+
+    policy.infer(_strict_observation(sequence_id=0, first_frame=0))
+    with pytest.raises(ValueError, match="sequence_id must increase"):
+        policy.infer(_strict_observation(sequence_id=0, first_frame=1))
+    assert len(backend.conditioning) == 1
+
+
+def test_strict_offline_policy_can_score_last_future_action(tmp_path: Path) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_strict_config(tmp_path)), backend=backend)
+    observation = _strict_observation(sequence_id=0, first_frame=0)
+    observation.update(
+        {
+            "evaluation_mode": "offline_action_selection",
+            "evaluation_action_selection": "last_future_action",
+        }
+    )
+
+    result = policy.infer(observation)
+
+    assert result["actions"][0, 0] == pytest.approx(0.11)
+    metadata = result["policy_metadata"]
+    assert metadata["action_selection"] == "last_future_action"
+    assert metadata["selected_prediction_index"] == 11
+    assert metadata["discarded_prediction_count"] == 11
+    assert result["policy_timing"]["queue_depth_after"] == 0
+
+
+def test_policy_passes_training_aligned_rgb_prefix_to_real_backend(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_config(tmp_path)), backend=backend)
+    observation = _observation(4)
+    observation["training_aligned_video_history"] = _video_history(5)
+
+    result = policy.infer(observation)
+
+    assert result["policy_timing"]["generated"] is True
+    assert result["policy_metadata"]["conditioning_source"] == (
+        "training_aligned_raw_rgb"
+    )
+    history = backend.conditioning[0]["history"]
+    assert isinstance(history, tuple)
+    assert len(history) == 5
+    assert set(history[-1]) == {
+        "observation.images.top",
+        "observation.images.wrist_l",
+    }
+    assert np.array_equal(
+        history[-1]["observation.images.top"],
+        observation["images"]["cam_high"],
+    )
+
+
+def test_policy_cached_latent_uses_same_public_policy_path(tmp_path: Path) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_config(tmp_path)), backend=backend)
+    latent = object()
+    observation = _observation()
+    observation["precomputed_video_latent"] = latent
+
+    result = policy.infer(observation)
+
+    assert result["policy_timing"]["generated"] is True
+    assert result["policy_metadata"]["conditioning_source"] == (
+        "precomputed_video_latent"
+    )
+    assert backend.conditioning[0]["latent"] is latent
+    assert backend.conditioning[0]["history"] is None
+
+
+def test_policy_rejects_ambiguous_or_unused_explicit_conditioning(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend(_backend_output())
+    policy = Policy(str(_config(tmp_path)), backend=backend)
+    ambiguous = _observation()
+    ambiguous["precomputed_video_latent"] = object()
+    ambiguous["training_aligned_video_history"] = _video_history(1)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        policy.infer(ambiguous)
+    assert backend.reset_calls == []
+
+    policy.infer(_observation())
+    queued = _observation(1)
+    queued["training_aligned_video_history"] = _video_history(1)
+    with pytest.raises(ValueError, match="only valid when a new plan"):
+        policy.infer(queued)
+    assert len(backend.conditioning) == 1
 
 
 def test_policy_emits_one_action_and_grounds_cold_chunk(tmp_path: Path) -> None:

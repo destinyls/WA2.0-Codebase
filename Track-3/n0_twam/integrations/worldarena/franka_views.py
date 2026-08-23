@@ -13,6 +13,9 @@ VIEW_SCHEMA_VERSION = 1
 DEVELOPMENT_TRAIN_VIEW = "franka_dev_train540_v1"
 DEVELOPMENT_VALIDATION_VIEW = "franka_dev_validation60_v1"
 FINAL_REFIT_VIEW = "franka_final_refit600_v1"
+TASK_FINETUNE_VIEWS = {
+    task: f"franka_task_{task}200_v1" for task in OFFICIAL_TASKS
+}
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,26 @@ def build_standard_franka_views() -> dict[str, FrankaDatasetView]:
     }
 
 
+def build_task_franka_views() -> dict[str, FrankaDatasetView]:
+    """Build one immutable all-episode view for each official task."""
+
+    return {
+        TASK_FINETUNE_VIEWS[task]: FrankaDatasetView(
+            view_id=TASK_FINETUNE_VIEWS[task],
+            role="task_finetune",
+            entries=tuple(
+                FrankaViewEntry(
+                    lerobot_episode_id=task_index * 200 + source_episode_id,
+                    task=task,
+                    source_episode_id=source_episode_id,
+                )
+                for source_episode_id in range(200)
+            ),
+        )
+        for task_index, task in enumerate(OFFICIAL_TASKS)
+    }
+
+
 def load_franka_view(path: Path) -> FrankaDatasetView:
     source = Path(path).expanduser().resolve(strict=True)
     try:
@@ -145,8 +168,10 @@ __all__ = (
     "DEVELOPMENT_TRAIN_VIEW",
     "DEVELOPMENT_VALIDATION_VIEW",
     "FINAL_REFIT_VIEW",
+    "TASK_FINETUNE_VIEWS",
     "FrankaDatasetView",
     "FrankaViewEntry",
     "build_standard_franka_views",
+    "build_task_franka_views",
     "load_franka_view",
 )

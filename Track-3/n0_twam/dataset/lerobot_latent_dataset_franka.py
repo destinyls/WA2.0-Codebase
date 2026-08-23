@@ -219,18 +219,26 @@ class FrankaLatentLeRobotDataset(LatentLeRobotDataset):
     def _sample_action_slots_per_frame(self) -> int:
         return self.franka_slots_per_frame
 
-    def _action_post_process(
+    def _hf_data_columns(self) -> list[str]:
+        return ["action", "observation.state"]
+
+    def _action_post_process_with_context(
         self,
         local_start_frame,
         local_end_frame,
         latent_frame_ids,
-        action,
+        data_dict,
     ):
+        if "observation.state" not in data_dict:
+            raise ValueError(
+                "Franka samples require observation.state for cold anchoring"
+            )
         targets = build_franka_ee10_latent_targets(
             local_start_frame=int(local_start_frame),
             local_end_frame=int(local_end_frame),
             latent_frame_ids=latent_frame_ids,
-            converted_actions=action,
+            converted_actions=data_dict["action"],
+            converted_states=data_dict["observation.state"],
             action_q01=np.asarray(self.config.norm_stat["q01"], dtype=np.float32)[:10],
             action_q99=np.asarray(self.config.norm_stat["q99"], dtype=np.float32)[:10],
             expected_slots_per_frame=self.franka_slots_per_frame,

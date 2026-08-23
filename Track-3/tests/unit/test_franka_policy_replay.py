@@ -26,7 +26,14 @@ class _Backend:
         assert prompt == "clear the table"
         assert seed >= 11
 
-    def infer(self, *, images, current_ee20) -> np.ndarray:
+    def infer(
+        self,
+        *,
+        images,
+        current_ee20,
+        precomputed_video_latent=None,
+        training_aligned_video_history=None,
+    ) -> np.ndarray:
         assert set(images) == {
             "observation.images.top",
             "observation.images.wrist_l",
@@ -56,11 +63,23 @@ class _MutatingBackend(_Backend):
         self.path = path
         self.mutated = False
 
-    def infer(self, *, images, current_ee20) -> np.ndarray:
+    def infer(
+        self,
+        *,
+        images,
+        current_ee20,
+        precomputed_video_latent=None,
+        training_aligned_video_history=None,
+    ) -> np.ndarray:
         if not self.mutated:
             self.path.write_bytes(self.path.read_bytes() + b"\n")
             self.mutated = True
-        return super().infer(images=images, current_ee20=current_ee20)
+        return super().infer(
+            images=images,
+            current_ee20=current_ee20,
+            precomputed_video_latent=precomputed_video_latent,
+            training_aligned_video_history=training_aligned_video_history,
+        )
 
 
 def _config(tmp_path: Path) -> Path:

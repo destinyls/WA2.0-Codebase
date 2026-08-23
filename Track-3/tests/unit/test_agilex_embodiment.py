@@ -82,19 +82,19 @@ def test_tampering_with_self_hashed_contracts_is_rejected() -> None:
 def test_registry_keeps_agilex_franka_and_univtac_explicitly_separate() -> None:
     assert set(list_embodiment_specs()) >= {
         "agilex_dual_qpos14_v1",
-        "franka_pose8_ee20_v1",
+        "franka_pose8_xyzw_ee20_v2",
         "univtac_panda_qpos8_v1",
     }
     assert set(list_action_route_specs()) >= {
         "agilex_qpos14_identity_v1",
-        "franka_pose8_to_ee20_v1",
+        "franka_pose8_xyzw_to_ee20_v2",
         "univtac_qpos8_identity_v1",
     }
     assert get_embodiment_spec("agilex_dual_qpos14_v1") is AGILEX_EMBODIMENT_SPEC
     assert get_action_route_spec("agilex_qpos14_identity_v1") is (
         AGILEX_ACTION_ROUTE_SPEC
     )
-    assert get_embodiment_spec("franka_pose8_ee20_v1").model_action_schema == (
+    assert get_embodiment_spec("franka_pose8_xyzw_ee20_v2").model_action_schema == (
         "ee20_absee"
     )
     assert get_embodiment_spec("univtac_panda_qpos8_v1").model_action_schema == (

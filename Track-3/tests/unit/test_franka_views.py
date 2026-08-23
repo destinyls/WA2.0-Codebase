@@ -10,6 +10,8 @@ from n0_twam.integrations.worldarena.franka_views import (
     DEVELOPMENT_TRAIN_VIEW,
     DEVELOPMENT_VALIDATION_VIEW,
     FINAL_REFIT_VIEW,
+    TASK_FINETUNE_VIEWS,
+    build_task_franka_views,
     build_standard_franka_views,
     load_franka_view,
 )
@@ -50,3 +52,15 @@ def test_franka_view_loader_rejects_resealed_roster_tampering(tmp_path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="IDs disagree|hash mismatch"):
         load_franka_view(path)
+
+
+def test_task_franka_views_select_all_200_episodes_per_task() -> None:
+    views = build_task_franka_views()
+
+    assert set(views) == set(TASK_FINETUNE_VIEWS.values())
+    for task, view_id in TASK_FINETUNE_VIEWS.items():
+        view = views[view_id]
+        assert view.role == "task_finetune"
+        assert len(view.entries) == 200
+        assert {entry.task for entry in view.entries} == {task}
+        assert {entry.source_episode_id for entry in view.entries} == set(range(200))

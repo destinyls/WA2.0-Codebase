@@ -22,4 +22,11 @@ def build_validation_dataset_config(config: Any) -> Any:
     # Never inherit the training view through the generic dataset adapter.
     validation_config.dataset_view_path = validation_view_path
     validation_config.train_view_id = validation_view_id
+    if validation_view_path is not None:
+        validation_config.dataset_view_file_sha256 = getattr(
+            config, "val_dataset_view_file_sha256", None
+        )
+        validation_config.dataset_view_sha256 = getattr(
+            config, "val_dataset_view_sha256", None
+        )
     return validation_config

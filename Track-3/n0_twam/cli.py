@@ -400,6 +400,28 @@ def _track32_generate_predictions_command(
         action_inference_steps=args.action_inference_steps,
         decode_batch_size=args.decode_batch_size,
         max_samples=args.max_samples,
+        conditioning_source=args.conditioning_source,
+    )
+
+
+def _track32_policy_conditioning_parity_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    from n0_twam.evaluation.franka_policy_conditioning_parity import (
+        evaluate_franka_policy_conditioning_parity,
+    )
+
+    return evaluate_franka_policy_conditioning_parity(
+        policy_config=args.policy_config,
+        artifact_root=args.artifact_root,
+        lerobot_root=args.lerobot_root,
+        base_model=args.base_model,
+        normalizer=args.normalizer,
+        dataset_view=args.dataset_view,
+        output=args.output,
+        samples_output=args.samples_output,
+        max_samples=args.max_samples,
+        action_selection=args.action_selection,
     )
 
 
@@ -477,6 +499,9 @@ def _track32_build_request_command(args: argparse.Namespace) -> dict[str, object
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_latent_frames=args.max_latent_frames,
         seed=args.seed,
+        action_loss_profile=args.action_loss_profile,
+        train_view_id=args.train_view_id,
+        normalizer_source_view_id=args.normalizer_source_view_id,
     )
 
 
@@ -552,6 +577,8 @@ def _build_parser() -> argparse.ArgumentParser:
     build_request.add_argument(
         "--run-role", choices=("development", "final_refit"), default="development"
     )
+    build_request.add_argument("--train-view-id")
+    build_request.add_argument("--normalizer-source-view-id")
     build_request.add_argument("--num-steps", type=int, default=1500)
     build_request.add_argument("--stop-after-step", type=int, default=1500)
     build_request.add_argument("--save-interval", type=int, default=300)
@@ -560,6 +587,11 @@ def _build_parser() -> argparse.ArgumentParser:
     build_request.add_argument("--gradient-accumulation-steps", type=int, default=1)
     build_request.add_argument("--max-latent-frames", type=int, default=5)
     build_request.add_argument("--seed", type=int, default=20260810)
+    build_request.add_argument(
+        "--action-loss-profile",
+        choices=("legacy_v1", "franka_trajectory_fit_v1"),
+        default="legacy_v1",
+    )
     build_request.set_defaults(handler=_track32_build_request_command)
     track32_train = track32_commands.add_parser(
         "train", help="run preflight, training, and checkpoint verification"
@@ -716,7 +748,49 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_predictions.add_argument("--action-inference-steps", type=int, default=4)
     generate_predictions.add_argument("--decode-batch-size", type=int, default=4)
     generate_predictions.add_argument("--max-samples", type=int)
+    generate_predictions.add_argument(
+        "--conditioning-source",
+        choices=("precomputed_video_latent", "training_aligned_raw_rgb"),
+        default="precomputed_video_latent",
+    )
     generate_predictions.set_defaults(handler=_track32_generate_predictions_command)
+
+    policy_conditioning_parity = track32_commands.add_parser(
+        "policy-conditioning-parity",
+        help=(
+            "compare training-aligned RGB and cached latent through Franka "
+            "Policy.infer"
+        ),
+    )
+    policy_conditioning_parity.add_argument(
+        "--policy-config", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument(
+        "--artifact-root", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument(
+        "--lerobot-root", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument(
+        "--base-model", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument(
+        "--normalizer", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument(
+        "--dataset-view", type=Path, required=True
+    )
+    policy_conditioning_parity.add_argument("--output", type=Path, required=True)
+    policy_conditioning_parity.add_argument("--samples-output", type=Path)
+    policy_conditioning_parity.add_argument("--max-samples", type=int)
+    policy_conditioning_parity.add_argument(
+        "--action-selection",
+        choices=("first_future_action", "last_future_action"),
+        default="first_future_action",
+    )
+    policy_conditioning_parity.set_defaults(
+        handler=_track32_policy_conditioning_parity_command
+    )
 
     pack_predictions = track32_commands.add_parser(
         "pack-predictions",

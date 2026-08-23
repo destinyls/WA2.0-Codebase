@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-REQUEST_SCHEMA_VERSION = 2
+REQUEST_SCHEMA_VERSION = 5
+ACTION_LOSS_PROFILES = frozenset({"legacy_v1", "franka_trajectory_fit_v1"})
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,50}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _NETWORK_INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
@@ -33,6 +34,7 @@ _PATH_FIELDS = frozenset(
         "empty_embedding_sha256",
         "init_from",
         "init_transformer_sha256",
+        "init_checkpoint_complete_sha256",
         "resume_from",
         "resume_checkpoint_identity_sha256",
         "output_root",
@@ -43,8 +45,12 @@ _ARTIFACT_FIELDS = frozenset(
         "prepare_receipt_sha256",
         "conversion_report_sha256",
         "latent_inventory_file_sha256",
+        "full_verification_receipt_sha256",
+        "train_view_id",
         "train_view_sha256",
         "validation_view_sha256",
+        "normalizer_source_view_id",
+        "normalizer_source_view_sha256",
         "normalizer_sha256",
     }
 )
@@ -59,6 +65,7 @@ _TRAIN_FIELDS = frozenset(
         "gradient_accumulation_steps",
         "max_latent_frames",
         "seed",
+        "action_loss_profile",
     }
 )
 
@@ -133,6 +140,7 @@ class Track32PathRequest:
     empty_embedding_sha256: str
     init_from: Path | None
     init_transformer_sha256: str | None
+    init_checkpoint_complete_sha256: str | None
     resume_from: Path | None
     resume_checkpoint_identity_sha256: str | None
     output_root: Path
@@ -143,8 +151,12 @@ class Track32ArtifactRequest:
     prepare_receipt_sha256: str
     conversion_report_sha256: str
     latent_inventory_file_sha256: str
+    full_verification_receipt_sha256: str | None
+    train_view_id: str
     train_view_sha256: str
     validation_view_sha256: str | None
+    normalizer_source_view_id: str
+    normalizer_source_view_sha256: str
     normalizer_sha256: str
 
 
@@ -159,6 +171,7 @@ class Track32TrainRecipe:
     gradient_accumulation_steps: int
     max_latent_frames: int
     seed: int
+    action_loss_profile: str
 
 
 @dataclass(frozen=True)
@@ -250,6 +263,11 @@ def _parse_paths(payload: Mapping[str, object], *, base: Path) -> Track32PathReq
             label="init transformer",
             optional=True,
         ),
+        init_checkpoint_complete_sha256=_sha(
+            payload.get("init_checkpoint_complete_sha256"),
+            label="init checkpoint completion",
+            optional=True,
+        ),
         resume_from=resume_from,
         resume_checkpoint_identity_sha256=_sha(
             payload.get("resume_checkpoint_identity_sha256"),
@@ -280,10 +298,26 @@ def _parse_artifacts(payload: Mapping[str, object]) -> Track32ArtifactRequest:
                 label="latent inventory file",
             )
         ),
+        full_verification_receipt_sha256=_sha(
+            payload.get("full_verification_receipt_sha256"),
+            label="full verification receipt",
+            optional=True,
+        ),
+        train_view_id=_view_id(payload.get("train_view_id"), label="train view ID"),
         train_view_sha256=str(
             _sha(payload.get("train_view_sha256"), label="train view")
         ),
         validation_view_sha256=validation,
+        normalizer_source_view_id=_view_id(
+            payload.get("normalizer_source_view_id"),
+            label="normalizer source view ID",
+        ),
+        normalizer_source_view_sha256=str(
+            _sha(
+                payload.get("normalizer_source_view_sha256"),
+                label="normalizer source view",
+            )
+        ),
         normalizer_sha256=str(
             _sha(payload.get("normalizer_sha256"), label="normalizer")
         ),
@@ -299,6 +333,12 @@ def _parse_train(payload: Mapping[str, object]) -> Track32TrainRecipe:
     stop = _positive(payload.get("stop_after_step"), label="train.stop_after_step")
     if stop > total:
         raise ValueError("train.stop_after_step cannot exceed num_steps")
+    action_loss_profile = payload.get("action_loss_profile")
+    if action_loss_profile not in ACTION_LOSS_PROFILES:
+        raise ValueError(
+            "train.action_loss_profile must be legacy_v1 or "
+            "franka_trajectory_fit_v1"
+        )
     return Track32TrainRecipe(
         run_role=str(role),
         num_steps=total,
@@ -313,7 +353,18 @@ def _parse_train(payload: Mapping[str, object]) -> Track32TrainRecipe:
             payload.get("max_latent_frames"), label="max_latent_frames"
         ),
         seed=_nonnegative(payload.get("seed"), label="seed"),
+        action_loss_profile=str(action_loss_profile),
     )
+
+
+def _view_id(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", value) is None
+    ):
+        raise ValueError(f"{label} is invalid")
+    return value
 
 
 def _overlap(left: Path, right: Path) -> bool:
@@ -326,6 +377,8 @@ def _validate_route(request: Track32TrainRequest) -> None:
         raise ValueError("exactly one of paths.init_from/resume_from is required")
     if (paths.init_from is None) != (paths.init_transformer_sha256 is None):
         raise ValueError("fresh init requires exactly one transformer SHA256")
+    if paths.init_from is None and paths.init_checkpoint_complete_sha256 is not None:
+        raise ValueError("only checkpoint init may declare a completion SHA256")
     if (paths.resume_from is None) != (paths.resume_checkpoint_identity_sha256 is None):
         raise ValueError("resume requires exactly one checkpoint identity SHA256")
     protected = [
@@ -340,8 +393,16 @@ def _validate_route(request: Track32TrainRequest) -> None:
     if request.train.run_role == "development":
         if request.artifacts.validation_view_sha256 is None:
             raise ValueError("development requires a validation view SHA256")
+        if (
+            request.artifacts.train_view_id != "franka_dev_train540_v1"
+            or request.artifacts.normalizer_source_view_id
+            != "franka_dev_train540_v1"
+        ):
+            raise ValueError("development view identity mismatch")
     elif request.artifacts.validation_view_sha256 is not None:
         raise ValueError("final_refit must not declare a validation view SHA256")
+    elif request.artifacts.normalizer_source_view_id != "franka_final_refit600_v1":
+        raise ValueError("final_refit must retain the all600 normalizer")
 
 
 def load_track32_train_request(path: Path) -> Track32TrainRequest:
@@ -389,6 +450,7 @@ def track32_train_request_template() -> dict[str, object]:
             "empty_embedding_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
             "init_from": "./models/n0-twam-base",
             "init_transformer_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+            "init_checkpoint_complete_sha256": None,
             "resume_from": None,
             "resume_checkpoint_identity_sha256": None,
             "output_root": "./outputs/track32-franka-dev",
@@ -397,8 +459,12 @@ def track32_train_request_template() -> dict[str, object]:
             "prepare_receipt_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
             "conversion_report_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
             "latent_inventory_file_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+            "full_verification_receipt_sha256": None,
+            "train_view_id": "franka_dev_train540_v1",
             "train_view_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
             "validation_view_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+            "normalizer_source_view_id": "franka_dev_train540_v1",
+            "normalizer_source_view_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
             "normalizer_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
         },
         "train": {
@@ -411,12 +477,14 @@ def track32_train_request_template() -> dict[str, object]:
             "gradient_accumulation_steps": 1,
             "max_latent_frames": 5,
             "seed": 20260810,
+            "action_loss_profile": "legacy_v1",
         },
     }
 
 
 __all__ = (
     "Track32TrainRequest",
+    "ACTION_LOSS_PROFILES",
     "load_track32_train_request",
     "track32_train_request_template",
 )

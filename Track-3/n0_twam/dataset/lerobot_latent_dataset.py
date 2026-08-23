@@ -322,7 +322,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.q01 = np.array(_norm_stat["q01"], dtype="float")[None]
         self.q99 = np.array(_norm_stat["q99"], dtype="float")[None]
         self._hf_torch_view = self.hf_dataset.with_format(
-            type="torch", columns=["action"], output_all_columns=False
+            type="torch",
+            columns=self._hf_data_columns(),
+            output_all_columns=False,
         )
         self._hf_tactile_view = None
         available_columns = set(getattr(self.hf_dataset, "column_names", []))
@@ -832,6 +834,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         batch = self._hf_torch_view[start_frame:end_frame]
         return batch
 
+    def _hf_data_columns(self) -> list[str]:
+        """Return raw LeRobot columns required by the action adapter."""
+
+        return ["action"]
+
     def _get_tactile_evaluation_source_metadata(
         self,
         *,
@@ -980,6 +987,22 @@ class LatentLeRobotDataset(LeRobotDataset):
         return (
             torch.from_numpy(action_aligned).float(),
             torch.from_numpy(action_mask_aligned).bool(),
+        )
+
+    def _action_post_process_with_context(
+        self,
+        local_start_frame,
+        local_end_frame,
+        latent_frame_ids,
+        data_dict,
+    ):
+        """Adapt actions while allowing embodiment-specific raw-state context."""
+
+        return self._action_post_process(
+            local_start_frame,
+            local_end_frame,
+            latent_frame_ids,
+            data_dict["action"],
         )
 
     def _load_tactile_latents(
@@ -1211,11 +1234,13 @@ class LatentLeRobotDataset(LeRobotDataset):
             # explicit drop flag so the model takes the zero-anchor path.
             out_dict["tactile_cond_drop"] = torch.tensor(True, dtype=torch.bool)
 
-        out_dict["actions"], out_dict["actions_mask"] = self._action_post_process(
-            local_start_frame,
-            local_end_frame,
-            latent_frame_ids,
-            ori_data_dict["action"],
+        out_dict["actions"], out_dict["actions_mask"] = (
+            self._action_post_process_with_context(
+                local_start_frame,
+                local_end_frame,
+                latent_frame_ids,
+                ori_data_dict,
+            )
         )
 
         out_dict["latents"] = out_dict["latents"].permute(3, 0, 1, 2)

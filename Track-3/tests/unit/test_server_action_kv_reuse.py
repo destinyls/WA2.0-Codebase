@@ -413,6 +413,8 @@ def test_agilex_and_franka_configs_enable_the_same_fail_safe_contract(
         "fixed_context_causal_v1"
     )
     assert franka.server_runtime_contract["action_denoise_kv_reuse"] is True
+    assert franka.cold_seed_mode == "current_state"
+    assert franka.server_runtime_contract["cold_seed_mode"] == "current_state"
     assert franka.server_runtime_contract["contract_sha256"] == (
         franka.server_runtime_contract_sha256
     )

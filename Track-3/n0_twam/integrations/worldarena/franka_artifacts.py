@@ -25,13 +25,16 @@ from .franka_views import (
     DEVELOPMENT_TRAIN_VIEW,
     DEVELOPMENT_VALIDATION_VIEW,
     FINAL_REFIT_VIEW,
+    TASK_FINETUNE_VIEWS,
     FrankaDatasetView,
+    build_task_franka_views,
     load_franka_view,
 )
 
 VIDEO_KEYS = ("observation.images.top", "observation.images.wrist_l")
 MODEL_ACTION_SCHEMA = "ee20_absee"
 SOURCE_ACTION_SCHEMA = FRANKA_ACTION_SCHEMA
+FULL_VERIFICATION_RECEIPT = "full600_xyzw_verification.json"
 
 
 def _json_object(path: Path, *, label: str) -> dict[str, object]:
@@ -135,12 +138,51 @@ class VerifiedFrankaArtifacts:
     dataset_root: Path
     train_view: FrankaDatasetView
     validation_view: FrankaDatasetView | None
+    normalizer_source_view: FrankaDatasetView
     normalizer: dict[str, object]
     conversion_report: dict[str, object]
     latent_inventory: dict[str, object]
     prepare_receipt_sha256: str
     conversion_report_sha256: str
     latent_inventory_sha256: str
+    full_verification_receipt_sha256: str | None
+
+
+def _validate_full_verification_receipt(
+    *,
+    artifacts: Path,
+    dataset: Path,
+    prepare_receipt_sha256: str,
+    conversion_report_sha256: str,
+    latent_inventory_sha256: str,
+    normalizer_sha256: object,
+) -> str:
+    """Bind a task view to the previously completed all600 byte audit."""
+
+    path = artifacts / FULL_VERIFICATION_RECEIPT
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("task fine-tuning requires the all600 verification receipt")
+    payload = _json_object(path, label="Franka all600 verification receipt")
+    expected = {
+        "status": "PASS",
+        "dataset_root": dataset.as_posix(),
+        "prepare_receipt_sha256": prepare_receipt_sha256,
+        "conversion_report_sha256": conversion_report_sha256,
+        "latent_inventory_file_sha256": latent_inventory_sha256,
+        "normalizer_sha256": normalizer_sha256,
+        "latent_record_count": 1200,
+        "train_episode_count": 600,
+        "train_view_id": FINAL_REFIT_VIEW,
+        "validation_view": None,
+    }
+    mismatches = {
+        field: (payload.get(field), wanted)
+        for field, wanted in expected.items()
+        if payload.get(field) != wanted
+    }
+    if mismatches:
+        raise ValueError(f"Franka all600 verification receipt mismatch: {mismatches}")
+    return sha256_file(path)
 
 
 def _validate_latent_payload(
@@ -261,11 +303,22 @@ def verify_franka_training_artifacts(
     lerobot_root: Path,
     base_model: Path,
     run_role: str,
+    train_view_id: str | None = None,
+    normalizer_source_view_id: str | None = None,
 ) -> VerifiedFrankaArtifacts:
-    """Recompute every input identity needed by a training launch."""
+    """Verify the inputs needed by a training launch.
+
+    Task fine-tuning consumes the immutable all600 verification receipt instead
+    of rehashing 600 parquet files, 1,200 latents, and the base encoder again.
+    Development and all600 training retain the original exhaustive path.
+    """
 
     artifacts = Path(artifact_root).expanduser().resolve(strict=True)
     dataset = Path(lerobot_root).expanduser().resolve(strict=True) / "all600"
+    task_finetune = (
+        run_role == "final_refit"
+        and train_view_id in frozenset(TASK_FINETUNE_VIEWS.values())
+    )
     _validate_lerobot_info(dataset)
     receipt_path = artifacts / "prepare_receipt.json"
     conversion_path = artifacts / "conversion_report.json"
@@ -280,7 +333,11 @@ def verify_franka_training_artifacts(
         or conversion.get("source_action_schema") != SOURCE_ACTION_SCHEMA
         or conversion.get("derived_action_schema") != DERIVED_ACTION_SCHEMA
         or conversion.get("official_records_sha256") != OFFICIAL_RECORDS_SHA256
-        or conversion.get("table_inventory") != build_lerobot_table_inventory(dataset)
+        or (
+            not task_finetune
+            and conversion.get("table_inventory")
+            != build_lerobot_table_inventory(dataset)
+        )
     ):
         raise ValueError("Franka conversion/receipt provenance mismatch")
     if receipt.get("conversion_report_sha256") != sha256_file(conversion_path):
@@ -295,16 +352,37 @@ def verify_franka_training_artifacts(
         )
     }
     if run_role == "development":
+        if train_view_id not in (None, DEVELOPMENT_TRAIN_VIEW):
+            raise ValueError("development must use the development train view")
+        if normalizer_source_view_id not in (None, DEVELOPMENT_TRAIN_VIEW):
+            raise ValueError("development must use the development normalizer")
         train_view = views[DEVELOPMENT_TRAIN_VIEW]
         validation_view: FrankaDatasetView | None = views[DEVELOPMENT_VALIDATION_VIEW]
+        normalizer_source_view = train_view
     elif run_role == "final_refit":
-        train_view = views[FINAL_REFIT_VIEW]
+        selected_view_id = train_view_id or FINAL_REFIT_VIEW
+        allowed = {FINAL_REFIT_VIEW, *TASK_FINETUNE_VIEWS.values()}
+        if selected_view_id not in allowed:
+            raise ValueError("final_refit train view is not an approved Franka view")
+        if selected_view_id == FINAL_REFIT_VIEW:
+            train_view = views[FINAL_REFIT_VIEW]
+        else:
+            train_view = load_franka_view(
+                artifacts / "views" / f"{selected_view_id}.json"
+            )
+            expected = build_task_franka_views()[selected_view_id]
+            if train_view != expected:
+                raise ValueError("Franka task view must contain all 200 task episodes")
         validation_view = None
+        selected_normalizer_id = normalizer_source_view_id or FINAL_REFIT_VIEW
+        if selected_normalizer_id != FINAL_REFIT_VIEW:
+            raise ValueError("final_refit must retain the all600 normalizer")
+        normalizer_source_view = views[FINAL_REFIT_VIEW]
     else:
         raise ValueError("Franka run_role must be development or final_refit")
     normalizer = _validate_normalizer(
-        artifacts / "normalizers" / f"{train_view.view_id}.json",
-        source_view=train_view,
+        artifacts / "normalizers" / f"{normalizer_source_view.view_id}.json",
+        source_view=normalizer_source_view,
     )
 
     inventory_path = artifacts / "franka_video_latent_inventory.json"
@@ -316,11 +394,15 @@ def verify_franka_training_artifacts(
         or inventory.get("source_records_sha256") != OFFICIAL_RECORDS_SHA256
     ):
         raise ValueError("Franka latent inventory canonical identity is invalid")
-    current_encoder = validate_encoder_source_identity(
-        build_encoder_source_identity(Path(base_model))
+    recorded_encoder = validate_encoder_source_identity(
+        inventory.get("encoder_source_identity")
     )
-    if inventory.get("encoder_source_identity") != current_encoder:
-        raise ValueError("Franka latent encoder source differs from the base model")
+    if not task_finetune:
+        current_encoder = validate_encoder_source_identity(
+            build_encoder_source_identity(Path(base_model))
+        )
+        if recorded_encoder != current_encoder:
+            raise ValueError("Franka latent encoder source differs from the base model")
     lengths = _episode_lengths(dataset)
     records = inventory.get("records")
     if not isinstance(records, list) or len(records) != 1200:
@@ -346,33 +428,52 @@ def verify_franka_training_artifacts(
         )
         if record.get("path") != expected_relative.as_posix():
             raise ValueError("Franka latent inventory path mismatch")
-        path = dataset / expected_relative
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_size != record.get("size_bytes")
-            or sha256_file(path) != record.get("sha256")
-        ):
-            raise ValueError(f"Franka latent payload bytes changed: {path}")
+        if not task_finetune:
+            path = dataset / expected_relative
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_size != record.get("size_bytes")
+                or sha256_file(path) != record.get("sha256")
+            ):
+                raise ValueError(f"Franka latent payload bytes changed: {path}")
     if actual_pairs != expected_pairs:
         raise ValueError("Franka latent inventory pair set is incomplete")
+    prepare_receipt_sha256 = sha256_file(receipt_path)
+    conversion_report_sha256 = sha256_file(conversion_path)
+    latent_inventory_sha256 = sha256_file(inventory_path)
+    full_verification_receipt_sha256 = (
+        _validate_full_verification_receipt(
+            artifacts=artifacts,
+            dataset=dataset,
+            prepare_receipt_sha256=prepare_receipt_sha256,
+            conversion_report_sha256=conversion_report_sha256,
+            latent_inventory_sha256=latent_inventory_sha256,
+            normalizer_sha256=normalizer.get("normalizer_sha256"),
+        )
+        if task_finetune
+        else None
+    )
     return VerifiedFrankaArtifacts(
         artifact_root=artifacts,
         dataset_root=dataset,
         train_view=train_view,
         validation_view=validation_view,
+        normalizer_source_view=normalizer_source_view,
         normalizer=normalizer,
         conversion_report=conversion,
         latent_inventory=inventory,
-        prepare_receipt_sha256=sha256_file(receipt_path),
-        conversion_report_sha256=sha256_file(conversion_path),
-        latent_inventory_sha256=sha256_file(inventory_path),
+        prepare_receipt_sha256=prepare_receipt_sha256,
+        conversion_report_sha256=conversion_report_sha256,
+        latent_inventory_sha256=latent_inventory_sha256,
+        full_verification_receipt_sha256=full_verification_receipt_sha256,
     )
 
 
 __all__ = (
     "MODEL_ACTION_SCHEMA",
     "SOURCE_ACTION_SCHEMA",
+    "FULL_VERIFICATION_RECEIPT",
     "VIDEO_KEYS",
     "VerifiedFrankaArtifacts",
     "finalize_franka_video_latents",

@@ -10,6 +10,8 @@ Detailed references:
 - [Track 3.1 quickstart](docs/TRACK31_QUICKSTART.md)
 - [Track 3.1 data and evaluation contract](docs/TRACK31_UNIVTAC.md)
 - [Track 3.2 Franka contract](docs/TRACK32_FRANKA.md)
+- [Track 3.2 Franka training-aligned real-robot deployment](docs/TRACK32_FRANKA_TRAINING_ALIGNED_REAL_ROBOT.md)
+- [Track 3.2 Franka real-robot handoff package](handoff/franka-real-robot/README.md)
 - [Track 3.2 AgileX qpos14 contract](docs/TRACK32_AGILEX.md)
 - [Post-training configuration](docs/POST_TRAINING.md)
 - [Deployment](docs/DEPLOY.md)
@@ -19,7 +21,7 @@ Detailed references:
 | Route | Implemented in this repository | Evidence boundary |
 |---|---|---|
 | UniVTAC Track 3.1 | Pinned download, frozen splits, conversion, latent encoding, strict training, and Target-10 proxy evaluation | Public-data/offline engineering evidence; not a hidden-test or robot result |
-| Franka Track 3.2 | Automated 600-episode preparation, EE20 post-training, strict checkpoints, offline metrics, synchronous Policy replay, and organizer-worker gate | The worker still requires organizer credentials, an approved robot cell, and official task-success evaluation |
+| Franka Track 3.2 | Automated 600-episode preparation, EE20 post-training, strict checkpoints, offline metrics, schema-v4 future-six Policy, causal RGB-history adapter, and organizer-worker gate | CODE/SMOKE evidence only; the worker still requires organizer credentials, an approved robot cell, executor-timing verification, and official task-success evaluation |
 | AgileX Track 3.2 | Pinned official reader and materializer, qpos14 training, `vision_tactile`/`mixed`/`vision_only`, strict checkpoints, Stage-B weights-only initialization, offline metrics, synchronous re-grounding, and an in-process Policy adapter | Offline evaluation uses training-distribution samples; physical-camera, real-robot, and leaderboard evaluation remain incomplete |
 
 The test count is intentionally not pinned in this document because it changes
@@ -640,6 +642,35 @@ n0-twam track32 generate-predictions --help
 n0-twam track32 score-predictions --help
 ```
 
+The generated Franka Policy template uses schema v4. Keep the signed live
+execution fields unchanged:
+
+```json
+{
+  "schema_version": 4,
+  "max_chunk_actions": 12,
+  "external_chunk_actions": 6,
+  "live_contract": {
+    "conditioning_mode": "training_aligned_rgb_replan_v1",
+    "target_fps": 10,
+    "frame_interval_tolerance_ms": 15.0,
+    "max_state_image_skew_ms": 50.0,
+    "max_history_frames": 5,
+    "action_hz": 15,
+    "actions_per_replan": 6,
+    "future_start_index": 6,
+    "require_dual_camera_history": true,
+    "require_fresh_observation_after_chunk": true
+  }
+}
+```
+
+The model output remains `[20,2,6]` (12 flattened action slots). The strict
+Franka Policy skips conditioning slots `[0:6]`, returns only future actions
+`[6:12]`, and retains no second batch. After those six actions, a new Policy
+request must contain newer measured state and a causally reconstructed dual-RGB
+history before the model plans again.
+
 The offline report contains future-RGB PSNR/SSIM and end-position MAE/RMSE.
 Before connecting to a robot, replay the real Policy backend on a frozen,
 non-pickled observation and require enough refills to evaluate latency:
@@ -656,37 +687,77 @@ n0-twam track32 policy-replay \
   --output "$N0_FRANKA_WORK/offline-policy-replay.json"
 ```
 
-Only after organizer approval, robot-cell calibration, credentials, and the
-launcher's clean-checkout XYZW bridge audit should the worker be started:
+### Franka: real-robot smoke and launch
+
+Before connecting to the Hub, simulate the required continuous 10-Hz camera
+capture across one 400-ms six-action interval:
+
+```bash
+python script/track3_2/simulate_franka_live_history_transport.py \
+  --policy-config "$N0_FRANKA_WORK/policy.json" \
+  --gap-seconds 0.4 \
+  --cycles 3 \
+  --output "$N0_FRANKA_WORK/live-history-transport.json"
+```
+
+The result must report `status=verified`,
+`future_prediction_range=[6,12]`, `return_batches_per_plan=1`, and
+`fresh_plan_per_returned_batch=true`.
+
+Only after organizer approval, robot-cell calibration, credentials, the
+continuous-history simulation, and the clean-checkout XYZW bridge audit should
+the worker be preflighted and started:
 
 ```bash
 export WORLD_ARENA_ROOT=/absolute/path/to/WorldArena-2.0
 export N0_TRACK32_POLICY_CONFIG="$N0_FRANKA_WORK/policy.json"
 export HUB_POLICY_URL=https://ORGANIZER_GATEWAY/policy
 export POLICY_ID=ORGANIZER_ASSIGNED_WORKER_KEY
+
+python -m n0_twam.cli track32 worker \
+  --worldarena-root "$WORLD_ARENA_ROOT" \
+  --config "$N0_TRACK32_POLICY_CONFIG" \
+  --hub-url "$HUB_POLICY_URL" \
+  --worker-key "$POLICY_ID" \
+  --dry-run
+
+# Set HUB_TOKEN through the environment when the organizer requires it.
 bash run_track32_franka_worker.sh
 ```
 
 Never put the optional bearer token in a committed file. Offline metrics and
-Policy replay remain engineering proxies, not a real-robot success rate.
+Policy replay remain engineering proxies, not a real-robot success rate. The
+complete configuration, launch, trace fields, and fail-closed checks are in
+[TRACK32_FRANKA_TRAINING_ALIGNED_REAL_ROBOT.md](docs/TRACK32_FRANKA_TRAINING_ALIGNED_REAL_ROBOT.md).
 
 ## Runtime and inference semantics
 
-### Synchronous closed loop and re-grounding
+### Closed-loop action execution
 
-The AgileX and Franka Policy paths both support synchronous action-chunk
-execution with rolling cache re-grounding. A generated chunk is safety-projected
-against the latest measured state, executed actions and post-action observations
-are recorded, and the completed history is committed with
-`compute_kv_cache=True` before the next chunk is generated. Predicted cache
-entries are cleared while previously committed real observations are preserved.
+The AgileX Policy supports synchronous action execution with rolling cache
+re-grounding. A generated chunk is safety-projected against the latest measured
+state, executed actions and post-action observations are recorded, and the
+completed history is committed with `compute_kv_cache=True` before the next
+chunk is generated.
 
 AgileX internally generates 12 qpos14 actions and returns one `[1,14]` action per
-Policy call; contact routes also commit their tactile and wrench history. Franka
-uses its EE20 internal representation and commits only its vision/action history.
-Neither Policy overlaps model inference with robot execution. A synchronous
-Policy replay therefore verifies protocol, cache, and safety behavior, not an
-asynchronous realtime controller.
+Policy call; contact routes also commit their tactile and wrench history.
+
+Franka instead uses the strict `future6_then_fresh_replan` path. Every Policy
+call consumes the newest measured pose plus dual-camera `10 Hz`, `4k+1` causal
+history, generates 12 internal slots, and returns only `[6:12]` as a `[6,8]`
+absolute-XYZW/physical-gripper-width chunk. `queue_depth_after` is always zero;
+the next six actions cannot come from the previous plan. The command bridge
+converts calibrated model `width_m` to the official gripper `open_ratio`, while
+feedback prefers physical `width_m` or inverts the same calibration.
+
+The requested action cadence is 15 Hz, so six actions cover approximately
+400 ms. The A-side Policy cannot prove the private Hub/robot executor cadence:
+the robot-side trace must confirm six applied steps in about 400 ms, continuous
+RGB capture during execution, and a newer observation packet before the next
+inference. Neither Policy overlaps model inference with robot execution. A
+synchronous Policy replay therefore verifies protocol and safety behavior, not
+an asynchronous realtime controller or real-robot task success.
 
 ### Action-denoise KV reuse
 
@@ -722,6 +793,12 @@ frames. Hardware SDK/ROS sources, calibrated clock correlation, generation-bound
 Policy/cache reset, robot action arbitration, and supervised physical-camera
 tests remain deployment integrations. Unit tests with simulated 10-Hz input and
 multi-second fake inference are software evidence only.
+
+For strict Franka deployment, "latest-only" does not mean discarding the causal
+RGB prefix. Acquisition remains bounded and current, but each new
+`ObservationPacket` must also expose timestamped camera history so the adapter
+can reconstruct the training-time 10-Hz prefix. Supplying only the request-time
+latest frame after action execution is rejected.
 
 ## Development and verification
 
